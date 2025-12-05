@@ -2,7 +2,6 @@
 
 .env
 node_modules
-env.example
 
 deployments/
 

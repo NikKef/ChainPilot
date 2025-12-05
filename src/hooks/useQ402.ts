@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useCallback } from 'react';
-import { BrowserProvider } from 'ethers';
+import { BrowserProvider, parseEther } from 'ethers';
 import type { Q402PaymentRequest, Q402SignedMessage, Q402Witness } from '@/lib/services/q402/types';
 import type { TransactionPreview, TransactionResult, PolicyEvaluationResult } from '@/lib/types';
 
@@ -141,10 +141,21 @@ export function useQ402(options: Q402SigningOptions = {}): UseQ402Return {
         })),
       };
 
-      // Ensure numeric values are strings (ethers.js will handle the conversion)
+      // Convert amount to wei if it's a decimal value
+      let amountInWei = String(typedData.message.amount);
+      if (amountInWei.includes('.') || (parseFloat(amountInWei) < 1000 && parseFloat(amountInWei) > 0)) {
+        try {
+          amountInWei = parseEther(amountInWei).toString();
+          console.log('[Q402] Converted amount to wei:', typedData.message.amount, '->', amountInWei);
+        } catch (e) {
+          console.warn('[Q402] Failed to convert amount to wei, using as-is:', e);
+        }
+      }
+
+      // Ensure numeric values are properly formatted for EIP-712
       const value = {
         ...typedData.message,
-        amount: String(typedData.message.amount),
+        amount: amountInWei,
         deadline: Number(typedData.message.deadline),
         nonce: Number(typedData.message.nonce),
       };

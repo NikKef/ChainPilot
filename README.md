@@ -39,7 +39,7 @@ ChainPilot is a chat-based Web3 copilot that enables users to interact with the 
 
 ```
 src/
-├── app/                    # Next.js App Router
+├── app/                   # Next.js App Router
 │   ├── api/               # API Routes
 │   │   ├── chat/          # Chat endpoint
 │   │   ├── contracts/     # Contract generation/audit
@@ -103,24 +103,7 @@ npm install
 cp env.example .env.local
 ```
 
-Edit `.env.local` with your credentials:
-```env
-# Supabase
-NEXT_PUBLIC_SUPABASE_URL=your_supabase_url
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your_anon_key
-SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
-
-# ChainGPT
-CHAINGPT_API_KEY=your_chaingpt_api_key
-
-# BNB Chain
-BNB_TESTNET_RPC_URL=https://data-seed-prebsc-1-s1.binance.org:8545
-BNB_MAINNET_RPC_URL=https://bsc-dataseed.binance.org
-
-# Q402 (optional)
-Q402_API_URL=https://api.q402.io
-Q402_API_KEY=your_q402_api_key
-```
+Edit `.env.local` with your credentials.
 
 4. Set up the database:
    - Go to your Supabase project
@@ -200,7 +183,7 @@ npm run dev
 
 ## License
 
-MIT
+No License. © 2025 Nikolas Kefalonitis. All rights reserved.
 
 ## Acknowledgments
 

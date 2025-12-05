@@ -1,4 +1,4 @@
-import { keccak256, toUtf8Bytes, hexlify, randomBytes, TypedDataDomain, TypedDataField } from 'ethers';
+import { keccak256, toUtf8Bytes, hexlify, randomBytes, TypedDataDomain, TypedDataField, parseEther, parseUnits } from 'ethers';
 import type { PreparedTx } from '@/lib/types';
 import type {
   Q402PaymentRequest,
@@ -108,12 +108,31 @@ export class Q402Client {
     const now = Date.now();
     const deadline = now + Q402_FACILITATOR.requestExpiryMs;
 
+    // Convert amount to wei if it's a decimal string
+    let amountInWei = tx.value || '0';
+    if (options?.amount) {
+      // Check if the amount looks like a decimal (has a decimal point or is a small number)
+      const amountStr = options.amount.toString();
+      if (amountStr.includes('.') || (parseFloat(amountStr) < 1000 && !amountStr.startsWith('0x'))) {
+        try {
+          // Assume it's in ether/BNB and convert to wei
+          amountInWei = parseEther(amountStr).toString();
+          logger.q402('Converted amount to wei', { original: amountStr, wei: amountInWei });
+        } catch {
+          // If parsing fails, use the original value (might already be in wei)
+          amountInWei = amountStr;
+        }
+      } else {
+        amountInWei = amountStr;
+      }
+    }
+
     // Create payment details for x402 protocol compliance
     const paymentDetails: Q402PaymentDetails = {
       scheme: 'evm/eip7702-delegated-payment',
       networkId: this.config.network,
       token: options?.tokenAddress || '0x0000000000000000000000000000000000000000', // Native BNB
-      amount: options?.amount || tx.value || '0',
+      amount: amountInWei,
       to: this.config.recipientAddress,
       implementationContract: this.config.implementationContract,
       verifyingContract: this.config.verifyingContract,

@@ -89,6 +89,8 @@ export interface Q402PaymentRequest {
     deadline?: number;
   };
   paymentDetails?: Q402PaymentDetails;
+  /** The witness that was used for signing - must be reused for verification */
+  witness?: Q402Witness;
   createdAt: string;
   expiresAt: string;
 }

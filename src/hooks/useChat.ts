@@ -1,9 +1,26 @@
 'use client';
 
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { BrowserProvider } from 'ethers';
+import { BrowserProvider, parseEther } from 'ethers';
 import type { ChatMessage, ChatResponse, TransactionPreview, PolicyEvaluationResult } from '@/lib/types';
 import { useQ402 } from './useQ402';
+
+/**
+ * Check if a transaction is a native BNB transfer (not a contract interaction)
+ * Native transfers must be executed directly by the user's wallet, not via facilitator
+ */
+function isNativeBnbTransfer(preview: TransactionPreview): boolean {
+  // It's a native transfer if:
+  // 1. Type is 'transfer'
+  // 2. No token address (or token is native BNB zero address)
+  // 3. Has native value
+  const isTransferType = preview.type === 'transfer';
+  const isNativeToken = !preview.tokenAddress || 
+    preview.tokenAddress === '0x0000000000000000000000000000000000000000';
+  const hasNativeValue = preview.nativeValue && parseFloat(preview.nativeValue) > 0;
+  
+  return isTransferType && isNativeToken && hasNativeValue;
+}
 
 interface UseChatOptions {
   sessionId: string;
@@ -223,12 +240,61 @@ export function useChat({
     setIsLoading(true);
     
     try {
+      // Check if this is a native BNB transfer - must be executed directly by user
+      if (isNativeBnbTransfer(pendingTransaction)) {
+        console.log('[Chat] Native BNB transfer detected - executing directly from user wallet');
+        
+        // Add signing prompt message
+        setMessages(prev => [...prev, {
+          id: `msg_${Date.now()}_signing`,
+          sessionId,
+          role: 'assistant',
+          content: '🔐 Please confirm the transaction in your wallet...\n\n⚠️ This native BNB transfer will be executed directly from your wallet (you pay gas).',
+          createdAt: new Date().toISOString(),
+        }]);
+
+        // Execute directly from user's wallet
+        const signer = await provider.getSigner();
+        const tx = await signer.sendTransaction({
+          to: pendingTransaction.preparedTx.to,
+          value: parseEther(pendingTransaction.nativeValue || '0'),
+          data: pendingTransaction.preparedTx.data || '0x',
+        });
+        
+        console.log('[Chat] Direct transaction submitted:', tx.hash);
+        
+        // Wait for confirmation
+        const receipt = await tx.wait(1);
+        
+        if (receipt?.status === 1) {
+          setMessages(prev => {
+            const filtered = prev.filter(m => !m.content.includes('Please confirm the transaction'));
+            return [...filtered, {
+              id: `msg_${Date.now()}_tx`,
+              sessionId,
+              role: 'assistant',
+              content: `✅ Transaction confirmed!\n\nTransaction Hash: \`${tx.hash}\`\n\nYou can view it on the [block explorer](${pendingTransaction.network === 'mainnet' ? 'https://bscscan.com' : 'https://testnet.bscscan.com'}/tx/${tx.hash}).`,
+              createdAt: new Date().toISOString(),
+            }];
+          });
+          onTransactionSuccess?.(tx.hash);
+        } else {
+          throw new Error('Transaction failed on-chain');
+        }
+        
+        setPendingTransaction(null);
+        setPolicyDecision(null);
+        setIsLoading(false);
+        return;
+      }
+
+      // For other transactions (ERC20, swaps, etc.), use Q402 gas sponsorship
       // Add signing prompt message
       setMessages(prev => [...prev, {
         id: `msg_${Date.now()}_signing`,
         sessionId,
         role: 'assistant',
-        content: '🔐 Please sign the transaction in your wallet...',
+        content: '🔐 Please sign the transaction in your wallet...\n\n✨ Gas will be sponsored - you only need to sign!',
         createdAt: new Date().toISOString(),
       }]);
 
@@ -239,7 +305,7 @@ export function useChat({
         providerAvailable: !!provider,
       });
 
-      // Use Q402 to prepare, sign, and execute
+      // Use Q402 to prepare, sign, and execute (gas sponsored)
       const result = await prepareAndSign(
         pendingTransaction,
         policyDecision,

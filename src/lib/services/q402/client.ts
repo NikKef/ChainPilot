@@ -19,21 +19,66 @@ import { Q402_WITNESS_TYPES } from './types';
 import { NETWORKS, Q402_CONTRACTS, Q402_FACILITATOR, type NetworkType } from '@/lib/utils/constants';
 import { logger } from '@/lib/utils';
 import { ExternalApiError } from '@/lib/utils/errors';
+import { initializeFacilitator, type SettleRequest } from '@/lib/services/facilitator';
 
 /**
- * Module-level request storage that persists across client instances
+ * Resolve relative API URLs to absolute URLs for server-side requests
+ * In Next.js API routes, relative URLs don't work - we need absolute URLs
+ */
+function resolveApiUrl(baseUrl: string): string {
+  // If already absolute, return as-is
+  if (baseUrl.startsWith('http://') || baseUrl.startsWith('https://')) {
+    return baseUrl;
+  }
+  
+  // For server-side, construct absolute URL
+  // Use NEXT_PUBLIC_APP_URL or default to localhost
+  const appUrl = process.env.NEXT_PUBLIC_APP_URL || 
+                 process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` :
+                 'http://localhost:3000';
+  
+  return `${appUrl}${baseUrl}`;
+}
+
+/**
+ * Global request storage that persists across hot reloads in development
+ * Uses globalThis to survive webpack module recompilation
  * In production, this should be replaced with database or Redis storage
  */
-const globalRequestStore = new Map<string, Q402PaymentRequest>();
+const GLOBAL_STORE_KEY = '__q402_request_store__';
 
-// Clean up expired requests every 5 minutes
-if (typeof setInterval !== 'undefined') {
+// Declare the global type
+declare global {
+  // eslint-disable-next-line no-var
+  var __q402_request_store__: Map<string, Q402PaymentRequest> | undefined;
+  // eslint-disable-next-line no-var
+  var __q402_cleanup_initialized__: boolean | undefined;
+}
+
+// Get or create the global store
+function getGlobalRequestStore(): Map<string, Q402PaymentRequest> {
+  if (!globalThis.__q402_request_store__) {
+    globalThis.__q402_request_store__ = new Map<string, Q402PaymentRequest>();
+    console.log('[Q402] Created new global request store');
+  }
+  return globalThis.__q402_request_store__;
+}
+
+// Clean up expired requests every 5 minutes (only initialize once)
+if (typeof setInterval !== 'undefined' && !globalThis.__q402_cleanup_initialized__) {
+  globalThis.__q402_cleanup_initialized__ = true;
   setInterval(() => {
+    const store = getGlobalRequestStore();
     const now = new Date();
-    for (const [id, request] of globalRequestStore.entries()) {
+    let cleaned = 0;
+    for (const [id, request] of store.entries()) {
       if (new Date(request.expiresAt) < now) {
-        globalRequestStore.delete(id);
+        store.delete(id);
+        cleaned++;
       }
+    }
+    if (cleaned > 0) {
+      console.log(`[Q402] Cleaned up ${cleaned} expired requests`);
     }
   }, 5 * 60 * 1000);
 }
@@ -52,7 +97,7 @@ export class Q402Client {
     const contracts = Q402_CONTRACTS[network];
 
     this.config = {
-      apiUrl: Q402_FACILITATOR.apiUrl,
+      apiUrl: resolveApiUrl(Q402_FACILITATOR.apiUrl),
       apiKey: process.env.Q402_API_KEY,
       chainId: NETWORKS[network].chainId,
       network: q402Network,
@@ -162,12 +207,24 @@ export class Q402Client {
   /**
    * Create EIP-712 typed data for wallet signing
    * This creates the Witness structure the user must sign
+   * IMPORTANT: The witness is stored in the request for later verification
+   * NOTE: If witness already exists, reuse it to avoid generating different paymentIds
    */
   createTypedDataForSigning(
     request: Q402PaymentRequest,
     ownerAddress: string,
     nonce: number = 0
   ): Q402SignedMessage {
+    // CRITICAL: If witness already exists, reuse it!
+    // This prevents generating different paymentIds on multiple calls
+    if (request.witness) {
+      logger.q402('Reusing existing witness', {
+        requestId: request.id,
+        paymentId: request.witness.paymentId,
+      });
+      return this.buildTypedDataFromWitness(request.witness, request.chainId);
+    }
+
     const paymentDetails = request.paymentDetails;
     if (!paymentDetails) {
       throw new Error('Payment details not available on request');
@@ -182,11 +239,33 @@ export class Q402Client {
       paymentId: this.generatePaymentId(),
       nonce,
     };
+    
+    // Store the witness in the request for later verification
+    // This is critical - the SAME witness must be used for verification
+    request.witness = witness;
+    
+    // Update the stored request with the witness
+    // This is async but we don't need to wait for it
+    this.updateStoredRequest(request);
+    
+    logger.q402('Created typed data for signing', {
+      requestId: request.id,
+      owner: witness.owner,
+      paymentId: witness.paymentId,
+    });
 
+    return this.buildTypedDataFromWitness(witness, request.chainId);
+  }
+
+  /**
+   * Build typed data structure from an existing witness
+   * Used to ensure consistent typed data when witness already exists
+   */
+  private buildTypedDataFromWitness(witness: Q402Witness, chainId?: number): Q402SignedMessage {
     const domain: TypedDataDomain = {
       name: 'q402',
       version: '1',
-      chainId: request.chainId,
+      chainId: chainId || this.config.chainId,
       verifyingContract: this.config.verifyingContract,
     };
 
@@ -231,7 +310,7 @@ export class Q402Client {
   }
 
   /**
-   * Verify a signature against the facilitator API
+   * Verify a signature using the facilitator service directly
    */
   async verifySignature(
     requestId: string,
@@ -243,36 +322,36 @@ export class Q402Client {
       return { valid: false, error: 'Request not found' };
     }
 
-    try {
-      // In production, call the facilitator API
-      const response = await fetch(
-        `${this.config.apiUrl}${Q402_FACILITATOR.endpoints.verify}`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(this.config.apiKey && { 'Authorization': `Bearer ${this.config.apiKey}` }),
-          },
-          body: JSON.stringify({
-            networkId: this.config.network,
-            requestId,
-            signature,
-            signerAddress,
-            paymentDetails: request.paymentDetails,
-          }),
-        }
-      );
-
-      if (!response.ok) {
-        // Fallback to local verification for demo/development
-      logger.warn('Facilitator API unavailable, using local verification', {});
+    // CRITICAL: Use the stored witness that was used for signing
+    // Creating a new witness would result in a different paymentId and signature mismatch
+    if (!request.witness) {
+      logger.warn('No stored witness found, using local verification');
       return this.localVerifySignature(request, signature, signerAddress);
-      }
+    }
 
-      return await response.json();
+    try {
+      // Initialize the facilitator service directly (no HTTP call needed)
+      const network = this.config.network === 'bsc-mainnet' ? 'mainnet' : 'testnet';
+      const facilitator = await initializeFacilitator(network);
+      
+      logger.q402('Verifying signature with stored witness', {
+        requestId,
+        paymentId: request.witness.paymentId,
+        owner: request.witness.owner,
+      });
+      
+      // Call the facilitator service directly for verification
+      const result = await facilitator.verify({
+        networkId: this.config.network,
+        witness: request.witness,
+        signature,
+        signerAddress,
+      });
+      
+      return result;
     } catch (error) {
       // Fallback to local verification
-      logger.warn('Facilitator API error, using local verification', { error: String(error) });
+      logger.warn('Facilitator service error, using local verification', { error: String(error) });
       return this.localVerifySignature(request, signature, signerAddress);
     }
   }
@@ -373,44 +452,64 @@ export class Q402Client {
 
   /**
    * Submit transaction to Q402 facilitator for gas-sponsored execution
+   * Uses direct service call instead of HTTP to avoid server-to-server fetch issues
    */
   private async submitToFacilitator(
     request: Q402PaymentRequest,
     executionRequest: Q402ExecutionRequest
   ): Promise<FacilitatorSettleResponse> {
+    // CRITICAL: Must use the stored witness that was used for signing
+    if (!request.witness) {
+      logger.error('No stored witness found - cannot verify signature');
+      return {
+        success: false,
+        error: 'No witness data available for settlement',
+      };
+    }
+
     try {
-      const response = await fetch(
-        `${this.config.apiUrl}${Q402_FACILITATOR.endpoints.settle}`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(this.config.apiKey && { 'Authorization': `Bearer ${this.config.apiKey}` }),
-          },
-          body: JSON.stringify({
-            networkId: this.config.network,
-            requestId: request.id,
-            signature: executionRequest.signature,
-            signerAddress: executionRequest.signerAddress,
-            transaction: request.transaction,
-            paymentDetails: request.paymentDetails,
-            authorization: executionRequest.authorization,
-          }),
-        }
-      );
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        logger.warn('Facilitator settlement failed', { status: response.status, error: errorText });
-        return { success: false, error: errorText };
+      // Initialize the facilitator service directly (no HTTP call needed)
+      const network = this.config.network === 'bsc-mainnet' ? 'mainnet' : 'testnet';
+      const facilitator = await initializeFacilitator(network);
+      
+      // Build settle request using the STORED witness
+      const settleRequest: SettleRequest = {
+        networkId: this.config.network,
+        requestId: request.id,
+        witness: request.witness,  // Use the stored witness!
+        signature: executionRequest.signature,
+        signerAddress: executionRequest.signerAddress,
+        transaction: request.transaction,
+      };
+      
+      logger.info('Submitting to facilitator service directly', {
+        requestId: request.id,
+        signerAddress: executionRequest.signerAddress,
+        paymentId: request.witness.paymentId,
+        network,
+      });
+      
+      // Call the facilitator service directly
+      const result = await facilitator.settle(settleRequest);
+      
+      if (result.success) {
+        logger.info('Facilitator settlement successful', {
+          requestId: request.id,
+          txHash: result.txHash,
+        });
+      } else {
+        logger.warn('Facilitator settlement failed', {
+          requestId: request.id,
+          error: result.error,
+        });
       }
-
-      return await response.json();
+      
+      return result;
     } catch (error) {
-      logger.warn('Facilitator API unavailable', { error: String(error) });
+      logger.error('Facilitator service error', { error: String(error) });
       return { 
         success: false, 
-        error: error instanceof Error ? error.message : 'Facilitator unavailable' 
+        error: error instanceof Error ? error.message : 'Facilitator service error' 
       };
     }
   }
@@ -594,7 +693,8 @@ export class Q402Client {
     const request = await this.getRequest(requestId);
     if (!request) return false;
 
-    globalRequestStore.delete(requestId);
+    const store = getGlobalRequestStore();
+    store.delete(requestId);
     return true;
   }
 
@@ -610,16 +710,33 @@ export class Q402Client {
    * Note: In production, this should store to database or Redis
    */
   private async storeRequest(request: Q402PaymentRequest): Promise<void> {
-    globalRequestStore.set(request.id, request);
-    logger.q402('Request stored', { requestId: request.id, storeSize: globalRequestStore.size });
+    const store = getGlobalRequestStore();
+    store.set(request.id, request);
+    logger.q402('Request stored', { requestId: request.id, storeSize: store.size });
+  }
+
+  /**
+   * Update an existing stored request (e.g., after adding witness)
+   */
+  private updateStoredRequest(request: Q402PaymentRequest): void {
+    const store = getGlobalRequestStore();
+    if (store.has(request.id)) {
+      store.set(request.id, request);
+      logger.q402('Request updated with witness', { 
+        requestId: request.id, 
+        hasWitness: !!request.witness,
+        paymentId: request.witness?.paymentId,
+      });
+    }
   }
 
   /**
    * Get request from global store
    */
   private async getRequest(requestId: string): Promise<Q402PaymentRequest | undefined> {
-    const request = globalRequestStore.get(requestId);
-    logger.q402('Request lookup', { requestId, found: !!request, storeSize: globalRequestStore.size });
+    const store = getGlobalRequestStore();
+    const request = store.get(requestId);
+    logger.q402('Request lookup', { requestId, found: !!request, storeSize: store.size });
     return request;
   }
 
@@ -627,7 +744,8 @@ export class Q402Client {
    * Delete request from store (used after execution)
    */
   deleteRequest(requestId: string): void {
-    globalRequestStore.delete(requestId);
+    const store = getGlobalRequestStore();
+    store.delete(requestId);
   }
 }
 

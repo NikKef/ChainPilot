@@ -124,12 +124,12 @@ export class TransactionSettler {
 
       // 3. Check sponsor wallet balance
       const sponsorBalance = await this.getSponsorBalance();
-      const minBalanceWei = parseUnits('0.01', 18); // Minimum 0.01 BNB
+      const minBalanceWei = parseUnits('0.001', 18); // Minimum 0.001 BNB (lowered for testnet)
       
       if (sponsorBalance < minBalanceWei) {
         logger.error('Sponsor wallet has insufficient funds', {
           balance: formatUnits(sponsorBalance, 18),
-          required: '0.01 BNB',
+          required: '0.001 BNB',
         });
         return {
           success: false,
@@ -283,6 +283,13 @@ export class TransactionSettler {
 
   /**
    * Execute a custom transaction (for general actions like transfers, swaps)
+   * 
+   * SECURITY: The facilitator should NEVER send funds from its own wallet.
+   * It should only pay gas to execute transactions that use the USER's funds
+   * via smart contract interactions (approve/transferFrom pattern).
+   * 
+   * For native BNB transfers: Requires Q402 contract with user's pre-deposited funds
+   * For ERC20 transfers: Requires user's prior approval to the Q402 contract
    */
   private async executeCustomTransaction(
     request: SettleRequest,
@@ -292,21 +299,57 @@ export class TransactionSettler {
       throw new Error('Transaction data required for custom execution');
     }
 
-    logger.info('Executing custom transaction', {
+    const txValue = BigInt(request.transaction.value || '0');
+    const hasData = request.transaction.data && request.transaction.data !== '0x';
+
+    logger.info('Analyzing custom transaction', {
       to: request.transaction.to,
       value: request.transaction.value,
+      hasData,
+      isNativeTransfer: txValue > 0n && !hasData,
     });
 
-    // Send the transaction from sponsor wallet
-    const tx = await this.sponsorWallet.sendTransaction({
-      to: request.transaction.to,
-      data: request.transaction.data,
-      value: BigInt(request.transaction.value || '0'),
-      gasLimit: this.config.maxGasLimit,
-      gasPrice,
-    });
+    // SECURITY CHECK: Prevent facilitator from sending its own funds
+    // Native BNB transfers (value > 0 with no contract data) are NOT supported
+    // via facilitator because we cannot move user's native BNB without their direct signature
+    if (txValue > 0n && !hasData) {
+      logger.error('SECURITY: Native BNB transfers cannot be executed via facilitator', {
+        requestedValue: formatUnits(txValue, 18),
+        to: request.transaction.to,
+        signerAddress: request.signerAddress,
+      });
+      
+      throw new Error(
+        'Native BNB transfers require direct wallet execution. ' +
+        'The facilitator can only sponsor gas for smart contract interactions ' +
+        '(ERC20 transfers, swaps, etc.) where the user has pre-approved the contract.'
+      );
+    }
 
-    return tx;
+    // For contract interactions (hasData = true), we execute the call
+    // The contract should be designed to use the user's funds via approval/permit
+    // The facilitator only pays gas - the actual tokens come from the user
+    if (hasData) {
+      logger.info('Executing contract interaction with gas sponsorship', {
+        to: request.transaction.to,
+        dataLength: request.transaction.data?.length,
+      });
+
+      // Execute the contract call - facilitator pays gas only
+      // The contract call itself should transfer from USER's balance, not facilitator's
+      const tx = await this.sponsorWallet.sendTransaction({
+        to: request.transaction.to,
+        data: request.transaction.data,
+        value: 0n, // Facilitator should NOT send any value
+        gasLimit: this.config.maxGasLimit,
+        gasPrice,
+      });
+
+      return tx;
+    }
+
+    // If we reach here, something unexpected happened
+    throw new Error('Transaction type not supported for gas sponsorship');
   }
 
   /**

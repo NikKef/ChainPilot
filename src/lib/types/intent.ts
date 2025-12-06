@@ -127,6 +127,7 @@ export interface BatchOperation {
   data?: string;
   // Special flags
   _usesPreviousOutput?: boolean; // Transfer uses output from previous operation
+  _linkedToSwapOutput?: boolean; // Transfer is linked to swap output (for batch execution)
 }
 
 /**

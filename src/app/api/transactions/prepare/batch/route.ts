@@ -30,6 +30,8 @@ interface OperationInput {
   methodName?: string;
   params?: unknown[];
   data?: string;
+  // For linked operations (e.g., transfer using swap output)
+  _linkedToSwapOutput?: boolean;
 }
 
 /**
@@ -135,17 +137,39 @@ export async function POST(request: NextRequest) {
     let totalValueUsd = 0;
     const tokensNeedingApproval: Set<string> = new Set();
 
+    // Track previous swap output for linked transfers
+    let lastSwapOutput: {
+      tokenAddress: string;
+      tokenSymbol: string;
+      amountOutMin: string;
+      decimals: number;
+      formattedAmount: string;
+    } | null = null;
+
     for (const op of body.operations) {
       if (op.type === 'transfer') {
-        // Build transfer operation
-        const tokenIn = op.tokenAddress || '0x0000000000000000000000000000000000000000';
-        const isNative = tokenIn === '0x0000000000000000000000000000000000000000' || !op.tokenAddress;
+        // Check if this transfer is linked to the previous swap's output
+        const isLinkedToSwap = op._linkedToSwapOutput && lastSwapOutput;
+        
+        // Use swap output token and amount if linked
+        const tokenIn = isLinkedToSwap 
+          ? lastSwapOutput!.tokenAddress 
+          : (op.tokenAddress || '0x0000000000000000000000000000000000000000');
+        const isNative = tokenIn === '0x0000000000000000000000000000000000000000';
         
         let amountInWei: string;
         let decimals = 18;
         let tokenSymbol = op.tokenSymbol || 'BNB';
+        let formattedAmount = op.amount || '0';
 
-        if (!isNative && op.tokenAddress) {
+        if (isLinkedToSwap && lastSwapOutput) {
+          // Use the swap output amount (minAmountOut ensures we have at least this much)
+          amountInWei = lastSwapOutput.amountOutMin;
+          decimals = lastSwapOutput.decimals;
+          tokenSymbol = lastSwapOutput.tokenSymbol;
+          formattedAmount = lastSwapOutput.formattedAmount;
+          // No need to check approval - we'll receive these tokens from the swap
+        } else if (!isNative && op.tokenAddress) {
           const tokenInfo = await getTokenInfo(op.tokenAddress, network);
           decimals = tokenInfo.decimals;
           tokenSymbol = tokenInfo.symbol;
@@ -172,17 +196,17 @@ export async function POST(request: NextRequest) {
           minAmountOut: '0',
           target: op.recipient || '0x0000000000000000000000000000000000000000',
           data: '0x',
-          description: `Transfer ${op.amount} ${tokenSymbol} to ${op.recipient?.slice(0, 10)}...`,
+          description: `Transfer ${isLinkedToSwap ? '~' : ''}${formattedAmount} ${tokenSymbol} to ${op.recipient?.slice(0, 10)}...`,
           tokenInSymbol: tokenSymbol,
-          formattedAmountIn: op.amount,
+          formattedAmountIn: formattedAmount,
         });
 
         previewOperations.push({
           type: 'transfer',
-          description: `Transfer ${op.amount} ${tokenSymbol}`,
+          description: `Transfer ${isLinkedToSwap ? '~' : ''}${formattedAmount} ${tokenSymbol}`,
           tokenIn,
           tokenInSymbol: tokenSymbol,
-          amountIn: op.amount,
+          amountIn: formattedAmount,
         });
 
       } else if (op.type === 'swap') {
@@ -234,10 +258,10 @@ export async function POST(request: NextRequest) {
         const WBNB = TOKENS[network].WBNB;
         const deadline = Math.floor(Date.now() / 1000) + 1200; // 20 minutes
         
-        // LIMITATION: Native BNB output swaps cannot use custom recipient in BatchExecutor
-        // because the contract checks owner's balance, not recipient's
-        // For native output, always send to the signer (user)
-        const swapOutputRecipient = isNativeOut ? body.signerAddress : (op.swapRecipient || body.signerAddress);
+        // LIMITATION: BatchExecutor contract checks owner's balance before/after swaps
+        // Custom recipients don't work because output goes to recipient, not owner
+        // Always send output to the signer (user) for BatchExecutor compatibility
+        const swapOutputRecipient = body.signerAddress;
         
         let swapData: string;
         const routerIface = new Interface([
@@ -301,6 +325,15 @@ export async function POST(request: NextRequest) {
           tokenOutSymbol,
           amountOut: formattedAmountOut,
         });
+
+        // Track swap output for linked transfers
+        lastSwapOutput = {
+          tokenAddress: isNativeOut ? '0x0000000000000000000000000000000000000000' : op.tokenOut!,
+          tokenSymbol: tokenOutSymbol,
+          amountOutMin: quote.amountOutMin,
+          decimals: tokenOutDecimals,
+          formattedAmount: formattedAmountOut,
+        };
 
       } else if (op.type === 'call') {
         // Build arbitrary call operation

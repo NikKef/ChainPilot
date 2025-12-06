@@ -108,6 +108,25 @@ export function useChat({
     swapData: string;
     swapRecipient?: string; // Optional: send swap output to different address
   } | null>(null);
+  const [isMultiOpBatch, setIsMultiOpBatch] = useState<boolean>(false);
+  const [multiOpBatchDetails, setMultiOpBatchDetails] = useState<{
+    operations: Array<{
+      type: 'transfer' | 'swap';
+      tokenIn?: string | null;
+      tokenInSymbol?: string;
+      tokenOut?: string | null;
+      tokenOutSymbol?: string;
+      amount?: string;
+      slippageBps?: number;
+      tokenAddress?: string | null;
+      tokenSymbol?: string;
+      recipient?: string;
+      _linkedToSwapOutput?: boolean;
+    }>;
+    operationCount: number;
+    estimatedSwapOutput: string;
+    swapOutputToken: { address: string | null; symbol: string; decimals: number } | null;
+  } | null>(null);
   
   const abortControllerRef = useRef<AbortController | null>(null);
   const loadedConversationRef = useRef<string | null>(null);
@@ -250,6 +269,17 @@ export function useChat({
           console.log('[Chat] Batch swap detected:', data.batchSwapDetails);
           setIsBatchSwap(true);
           setBatchSwapDetails(data.batchSwapDetails);
+          setIsDirectTransaction(false);
+          setIsSwapApproval(false);
+          setIsMultiOpBatch(false);
+        }
+        // Check for multi-operation batch (swap + transfer in one tx)
+        else if (data.isMultiOpBatch && data.multiOpBatchDetails) {
+          console.log('[Chat] Multi-operation batch detected:', data.multiOpBatchDetails);
+          setIsMultiOpBatch(true);
+          setMultiOpBatchDetails(data.multiOpBatchDetails);
+          setIsBatchSwap(false);
+          setBatchSwapDetails(null);
           setIsDirectTransaction(false);
           setIsSwapApproval(false);
           setPendingTransferId(undefined);
@@ -777,9 +807,106 @@ export function useChat({
         return;
       }
 
+      // Check if this is a multi-operation batch (e.g., swap + transfer)
+      if (isMultiOpBatch && multiOpBatchDetails) {
+        console.log('[Chat] Multi-operation batch detected - executing via BatchExecutor');
+        
+        setMessages(prev => [...prev, {
+          id: `msg_${Date.now()}_signing`,
+          sessionId,
+          role: 'assistant',
+          content: `🔐 Please **sign** the batch of ${multiOpBatchDetails.operationCount} operations in your wallet...\n\n✨ Gas will be sponsored - you only need to sign once for all operations!`,
+          createdAt: new Date().toISOString(),
+        }]);
+        
+        // Prepare multi-operation batch request
+        const batchResponse = await fetch('/api/transactions/prepare/batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId,
+            network: pendingTransaction?.network || 'testnet',
+            signerAddress,
+            operations: multiOpBatchDetails.operations,
+          }),
+        });
+        
+        const batchData = await batchResponse.json();
+        
+        if (!batchData.success) {
+          throw new Error(batchData.error || 'Failed to prepare multi-operation batch');
+        }
+        
+        // Sign the batch
+        const signer = await provider.getSigner();
+        const signature = await signer.signTypedData(
+          batchData.typedData.domain,
+          { BatchWitness: batchData.typedData.types.BatchWitness },
+          batchData.typedData.message
+        );
+        
+        // Execute via batch endpoint
+        const executeResponse = await fetch('/api/transactions/execute', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId,
+            actionLogId: batchData.requestId,
+            signature,
+            signerAddress,
+            network: pendingTransaction?.network || 'testnet',
+            isBatch: true,
+          }),
+        });
+        
+        const executeResult = await executeResponse.json();
+        
+        if (executeResult.success && executeResult.result.txHash) {
+          await logTransactionSuccess({
+            sessionId,
+            intentType: 'batch' as Intent['type'],
+            network: pendingTransaction?.network || 'testnet',
+            userMessage: lastUserMessage,
+            preview: pendingTransaction || undefined,
+            policyDecision,
+            txHash: executeResult.result.txHash,
+          });
+          
+          const opSummary = multiOpBatchDetails.operations.map((op, i) => {
+            if (op.type === 'swap') {
+              return `${i + 1}. Swapped ${op.amount} ${op.tokenInSymbol} → ${op.tokenOutSymbol}`;
+            } else {
+              return `${i + 1}. Transferred ${op.amount} ${op.tokenSymbol} → ${op.recipient?.slice(0, 10)}...`;
+            }
+          }).join('\n');
+          
+          setMessages(prev => {
+            const filtered = prev.filter(m => !m.content.includes('sign') && !m.content.includes('confirm'));
+            return [...filtered, {
+              id: `msg_${Date.now()}_tx`,
+              sessionId,
+              role: 'assistant',
+              content: `✅ **All ${multiOpBatchDetails.operationCount} operations executed successfully!** (Gas-free via BatchExecutor)\n\n${opSummary}\n\n🔗 [View on Explorer](https://${(pendingTransaction?.network || 'testnet') === 'mainnet' ? 'bscscan.com' : 'testnet.bscscan.com'}/tx/${executeResult.result.txHash})`,
+              createdAt: new Date().toISOString(),
+            }];
+          });
+          
+          onTransactionSuccess?.(executeResult.result.txHash);
+        } else {
+          throw new Error(executeResult.error || 'Multi-operation batch execution failed');
+        }
+        
+        setPendingTransaction(null);
+        setPolicyDecision(null);
+        setIsMultiOpBatch(false);
+        setMultiOpBatchDetails(null);
+        setIsLoading(false);
+        return;
+      }
+
       // Check if this is a swap that needs direct execution (not via Q402)
       // Swaps cannot use Q402 because DEX routers pull tokens from msg.sender
-      const isSwapTransaction = pendingTransaction.type === 'swap' && !isBatchSwap;
+      const isSwapTransaction = pendingTransaction.type === 'swap' && !isBatchSwap && !isMultiOpBatch;
       if (isSwapTransaction || isDirectTransaction) {
         console.log('[Chat] Swap/Direct transaction detected - executing directly from user wallet');
         
@@ -1011,7 +1138,7 @@ export function useChat({
     } finally {
       setIsLoading(false);
     }
-  }, [pendingTransaction, policyDecision, sessionId, provider, signerAddress, lastUserMessage, pendingTransferId, pendingSwapId, isSwapApproval, isDirectTransaction, isBatchSwap, batchSwapDetails, onError, onTransactionSuccess, prepareAndSign, resetQ402]);
+  }, [pendingTransaction, policyDecision, sessionId, provider, signerAddress, lastUserMessage, pendingTransferId, pendingSwapId, isSwapApproval, isDirectTransaction, isBatchSwap, batchSwapDetails, isMultiOpBatch, multiOpBatchDetails, onError, onTransactionSuccess, prepareAndSign, resetQ402]);
 
   const rejectTransaction = useCallback(async () => {
     // Log cancelled transaction to activity

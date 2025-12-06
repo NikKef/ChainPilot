@@ -133,7 +133,16 @@ export async function POST(request: NextRequest) {
 
     // Build operations
     const batchOperations: BatchOperation[] = [];
-    const previewOperations: BatchPrepareResponse['preview']['operations'] = [];
+    const previewOperations: Array<{
+      type: string;
+      description: string;
+      tokenIn?: string;
+      tokenInSymbol?: string;
+      amountIn?: string;
+      tokenOut?: string;
+      tokenOutSymbol?: string;
+      amountOut?: string;
+    }> = [];
     let totalValueUsd = 0;
     const tokensNeedingApproval: Set<string> = new Set();
 

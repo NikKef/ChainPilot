@@ -85,6 +85,7 @@ export default function ActivityPage() {
     if (isSessionReady && sessionId) {
       fetchLogs();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isSessionReady, sessionId, filter]);
 
   // Show connect wallet prompt if not connected

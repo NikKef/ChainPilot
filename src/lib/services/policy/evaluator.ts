@@ -460,7 +460,8 @@ export function evaluateBatchPolicy(
       valueUsd: op.valueUsd,
       todaySpendUsd: runningTodaySpend,
       slippageBps: op.slippageBps,
-      userAddress: context.userAddress,
+      walletAddress: context.userAddress,
+      network: 'testnet', // Default to testnet for batch operations
     };
 
     const opResult = evaluatePolicy(opContext);

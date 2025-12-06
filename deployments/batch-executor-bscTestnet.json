@@ -1,0 +1,14 @@
+{
+  "network": "bscTestnet",
+  "networkType": "testnet",
+  "chainId": 97,
+  "contractAddress": "0x61d2dd9121963Ab7be95befDb74Aad4C030C6186",
+  "deployerAddress": "0x8F3143E51Ed4Ee1Ab662CB50BB8B84E520D9D980",
+  "facilitatorAddress": "0x8F3143E51Ed4Ee1Ab662CB50BB8B84E520D9D980",
+  "pancakeRouterAddress": "0xD99D1c33F9fC3444f8101754aBC46c52416550D1",
+  "transactionHash": "0x25cbf9addbb2e575e11c8a99618823576866983380df5bce8677ebefe9f585de",
+  "domainSeparator": "0x2e4b6e6164e1360691e05b7b350bd97cc7e211ff29d5e1a3eb039a5e866717c8",
+  "deployedAt": "2025-12-06T16:21:35.539Z",
+  "contractName": "Q402BatchExecutor",
+  "version": "1"
+}

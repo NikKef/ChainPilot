@@ -58,6 +58,7 @@ export interface ChatResponse {
     isDirectTransaction?: boolean; // If true, user must send this directly (pays gas)
     slippageBps: number;
     estimatedOutput?: string;
+    useBatchExecutor?: boolean; // If true, use BatchExecutor for gas-sponsored swap
   };
   
   // For contract operations
@@ -66,6 +67,56 @@ export interface ChatResponse {
   
   // For research
   explanation?: string;
+  
+  // For batch swap execution (gas-sponsored via BatchExecutor)
+  isBatchSwap?: boolean;
+  batchSwapDetails?: {
+    tokenIn: string | null;
+    tokenInSymbol: string;
+    tokenOut: string | null;
+    tokenOutSymbol: string;
+    amountIn: string;
+    minAmountOut: string;
+    estimatedAmountOut: string;
+    slippageBps: number;
+    swapData: string;
+    swapRecipient?: string; // Optional: send swap output to different address
+  };
+  
+  // For multi-operation batch (e.g., swap + transfer in one tx)
+  isMultiOpBatch?: boolean;
+  multiOpBatchDetails?: {
+    operations: Array<{
+      type: 'transfer' | 'swap';
+      tokenIn?: string | null;
+      tokenInSymbol?: string;
+      tokenOut?: string | null;
+      tokenOutSymbol?: string;
+      amount?: string;
+      slippageBps?: number;
+      tokenAddress?: string | null;
+      tokenSymbol?: string;
+      recipient?: string;
+      _linkedToSwapOutput?: boolean;
+    }>;
+    operationCount: number;
+    estimatedSwapOutput: string;
+    swapOutputToken: { address: string | null; symbol: string; decimals: number } | null;
+  };
+  
+  // Flag for direct transactions (user pays gas)
+  isDirectTransaction?: boolean;
+  
+  // For linked transfers after swaps
+  _pendingLinkedTransfer?: {
+    recipient?: string;
+    tokenAddress?: string | null;
+    tokenSymbol?: string;
+    estimatedAmount: string;
+  };
+  
+  // For partial intents needing follow-up
+  partialIntent?: Partial<Intent>;
 }
 
 // ============================================

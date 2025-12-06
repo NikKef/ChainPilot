@@ -126,6 +126,9 @@ export interface PolicyViolation {
 export type PolicyViolationType =
   | 'exceeds_per_tx_limit'
   | 'exceeds_daily_limit'
+  | 'exceeds_batch_limit'
+  | 'batch_exceeds_per_tx_limit'
+  | 'batch_exceeds_daily_limit'
   | 'denied_token'
   | 'denied_contract'
   | 'unknown_contract'

@@ -1,0 +1,12 @@
+{
+  "contract": "Q402Vault",
+  "network": "bscTestnet",
+  "networkType": "testnet",
+  "chainId": 97,
+  "contractAddress": "0x30D282A8a5046e46Eb7Ad4174Fa851B1624ed8D2",
+  "deployerAddress": "0x8F3143E51Ed4Ee1Ab662CB50BB8B84E520D9D980",
+  "facilitatorAddress": "0x8F3143E51Ed4Ee1Ab662CB50BB8B84E520D9D980",
+  "transactionHash": "0xea3ad017b9db3f94d04ebaeb8c6f9e85e7e55c9c98a61cca0beeeb0a30d64c0d",
+  "domainSeparator": "0xf85fcefaed2e645bca6619914d3e1dcd21604dd9ef3c61fd7874435c3c40dd81",
+  "deployedAt": "2025-12-05T20:04:32.326Z"
+}

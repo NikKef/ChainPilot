@@ -689,6 +689,44 @@ async function buildResponse(
 
     case 'swap': {
       const swapIntent = intent as SwapIntent;
+      
+      // Check if this swap was part of a batch (reconstructed after follow-up)
+      const batchContext = (swapIntent as SwapIntent & { _batchContext?: { operations: BatchOperation[]; unresolvedOpIndex: number } })._batchContext;
+      if (batchContext && swapIntent.tokenOut) {
+        // This is a completed follow-up for a batch operation
+        // Reconstruct the full batch with the resolved token address
+        const { operations, unresolvedOpIndex } = batchContext;
+        
+        // Update the swap operation with the resolved tokenOut
+        const updatedOperations = operations.map((op, idx) => {
+          if (idx === unresolvedOpIndex && op.type === 'swap') {
+            return { ...op, tokenOut: swapIntent.tokenOut };
+          }
+          // Also update linked transfers with the resolved token
+          if (op.type === 'transfer' && op._linkedToSwapOutput && idx > unresolvedOpIndex) {
+            return { ...op, tokenAddress: swapIntent.tokenOut };
+          }
+          return op;
+        });
+        
+        // Re-process as batch with resolved tokens
+        const reconstructedBatchIntent: BatchIntent = {
+          type: 'batch',
+          network,
+          operations: updatedOperations,
+        };
+        
+        // Re-call buildResponse with the reconstructed batch intent
+        return buildResponse(
+          userMessage,
+          { intent: reconstructedBatchIntent, missingFields: [], questions: [], requiresFollowUp: false, confidence: 0.95 },
+          network,
+          walletAddress,
+          sessionId,
+          conversationId
+        );
+      }
+      
       if (!swapIntent.amount) {
         return {
           message: {
@@ -1203,7 +1241,7 @@ async function buildResponse(
             const partialSwapIntent = {
               type: 'swap' as const,
               network,
-              tokenIn: singleOp.tokenIn,
+              tokenIn: singleOp.tokenIn ?? undefined, // Convert null to undefined
               tokenInSymbol: singleOp.tokenInSymbol,
               tokenOut: undefined, // Missing - needs follow-up
               tokenOutSymbol: singleOp.tokenOutSymbol,
@@ -1377,9 +1415,9 @@ async function buildResponse(
           }
 
           // Fallback: direct execution
-          const content = `Ready to swap ${singleOp.amount} ${singleOp.tokenInSymbol} for approximately ${formattedOutput} ${singleOp.tokenOutSymbol}.${recipientDisplay}\n\n` +
+          const content = `Ready to swap ${singleOp.amount} ${singleOp.tokenInSymbol} for approximately ${formattedOutput} ${singleOp.tokenOutSymbol}.\n\n` +
             `⚠️ **Note**: You will need to pay gas for this swap transaction.\n\n` +
-            `📊 **Slippage tolerance**: ${slippageBps / 100}%`;
+            `📊 **Slippage tolerance**: ${slippageBps / 100}%${pendingTransferNote}`;
 
           return {
             message: {
@@ -1401,47 +1439,177 @@ async function buildResponse(
 
       // Handle multiple operations (true batch) - e.g., swap + transfer
       // Check if any operation has unresolved tokens
-      for (const op of processedOperations) {
+      for (let opIndex = 0; opIndex < processedOperations.length; opIndex++) {
+        const op = processedOperations[opIndex];
         if (op.type === 'swap') {
           const tokenOutUpperCase = op.tokenOutSymbol?.toUpperCase();
           const isExplicitlyNativeBNB = tokenOutUpperCase === 'BNB' || tokenOutUpperCase === 'TBNB';
           if (!op.tokenOut && !isExplicitlyNativeBNB && op.tokenOutSymbol) {
             // Need token address for swap output
-            const content = `${op.tokenOutSymbol} is available on mainnet but not on testnet. Please provide its contract address to continue.\n\n` +
-              `**Intent**: ${processedOperations.map(o => o.type).join(' → ')}`;
+            // Find the linked transfer to show the recipient
+            const linkedTransfer = processedOperations.find(o => o.type === 'transfer' && o._linkedToSwapOutput);
+            const recipientNote = linkedTransfer?.recipient 
+              ? `\n\n📤 After swap, output will be sent to: ${linkedTransfer.recipient.slice(0, 10)}...${linkedTransfer.recipient.slice(-8)}`
+              : '';
             
-            // Store full batch context for follow-up
+            const content = `${op.tokenOutSymbol} is available on mainnet but not on testnet. Please provide its contract address to continue.\n\n` +
+              `**Intent**: swap ${op.tokenInSymbol || 'Token'} → ${op.tokenOutSymbol}${linkedTransfer ? ' → transfer' : ''}${recipientNote}`;
+            
+            // IMPORTANT: Return a SWAP partial intent (not batch) because the intent parser
+            // knows how to handle swap follow-ups. Store batch context in custom field.
+            const partialSwapIntent = {
+              type: 'swap' as const,
+              network,
+              tokenIn: op.tokenIn ?? undefined, // Convert null to undefined
+              tokenInSymbol: op.tokenInSymbol,
+              tokenOut: undefined, // Missing - needs follow-up
+              tokenOutSymbol: op.tokenOutSymbol,
+              amount: op.amount || '0',
+              slippageBps: op.slippageBps || 300,
+              // Store full batch context for reconstruction after follow-up
+              _batchContext: {
+                operations: processedOperations,
+                unresolvedOpIndex: opIndex,
+              },
+            };
+            
             return {
               message: {
                 id: generateId(),
                 sessionId,
                 role: 'assistant',
                 content,
-                intent: {
-                  type: 'batch' as const,
-                  network,
-                  operations: processedOperations,
-                  _unresolvedTokenIndex: processedOperations.indexOf(op),
-                },
+                intent: partialSwapIntent, // Store as swap intent for proper follow-up handling
                 createdAt: new Date().toISOString(),
               },
-              intent: {
-                type: 'batch',
-                network,
-                operations: processedOperations,
-              },
+              intent: partialSwapIntent,
               requiresFollowUp: true,
-              partialIntent: {
-                type: 'batch',
-                operations: processedOperations,
-                _unresolvedTokenIndex: processedOperations.indexOf(op),
-              },
+              partialIntent: partialSwapIntent,
             };
           }
         }
       }
 
-      // Build operation descriptions and prepare batch
+      // Check if there's a linked transfer (transfer using swap output)
+      // This is problematic because user needs to approve output token AFTER receiving it
+      const hasLinkedTransfer = processedOperations.some(op => op.type === 'transfer' && op._linkedToSwapOutput);
+      
+      if (hasLinkedTransfer) {
+        // Find the swap and transfer operations
+        const swapOp = processedOperations.find(op => op.type === 'swap');
+        const transferOp = processedOperations.find(op => op.type === 'transfer' && op._linkedToSwapOutput);
+        
+        if (swapOp && transferOp) {
+          const slippageBps = swapOp.slippageBps || 300;
+          const { getSwapQuote } = await import('@/lib/services/web3/swaps');
+          
+          const quote = await getSwapQuote(
+            swapOp.tokenIn || 'native',
+            swapOp.tokenOut || 'native',
+            swapOp.amount || '0',
+            network,
+            slippageBps
+          );
+          
+          const tokenOutInfo = swapOp.tokenOut 
+            ? await getTokenInfo(swapOp.tokenOut, network)
+            : { decimals: 18, symbol: 'BNB' };
+          
+          const estimatedOutput = formatUnits(quote.amountOut, tokenOutInfo.decimals);
+          
+          // For linked transfers, we need to do swap first, then transfer
+          // The user will need to approve the output token for the transfer
+          const content = `I'll help you with this **2-step operation**:\n\n` +
+            `**Step 1**: Swap ${swapOp.amount} ${swapOp.tokenInSymbol} → ~${estimatedOutput} ${swapOp.tokenOutSymbol} ✨ (Gas-free)\n` +
+            `**Step 2**: Transfer the ${swapOp.tokenOutSymbol} to ${transferOp.recipient?.slice(0, 10)}...${transferOp.recipient?.slice(-8)} ✨ (Gas-free)\n\n` +
+            `⚠️ **Note**: After the swap completes, you'll need to approve ${swapOp.tokenOutSymbol} for transfer. This is a one-time approval.\n\n` +
+            `📊 **Slippage tolerance**: ${slippageBps / 100}%\n\n` +
+            `Ready to start with the swap?`;
+          
+          // Return as a single swap for now - after completion, user can do transfer
+          const swapIntent: SwapIntent = {
+            type: 'swap',
+            network,
+            tokenIn: swapOp.tokenIn || undefined,
+            tokenInSymbol: swapOp.tokenInSymbol,
+            tokenOut: swapOp.tokenOut || undefined,
+            tokenOutSymbol: swapOp.tokenOutSymbol,
+            amount: swapOp.amount,
+            slippageBps,
+          };
+          
+          const swapResult = await buildSwap(
+            walletAddress,
+            swapOp.tokenIn || null,
+            swapOp.tokenOut || null,
+            swapOp.amount || '0',
+            network,
+            slippageBps
+          );
+          
+          const preview = await createTransactionPreview(
+            'swap',
+            swapResult.preparedTx,
+            {
+              from: walletAddress,
+              network,
+              amount: swapOp.amount,
+              tokenInSymbol: swapOp.tokenInSymbol,
+              tokenOutSymbol: swapOp.tokenOutSymbol,
+              tokenOutAmount: estimatedOutput,
+              slippageBps,
+            }
+          );
+          
+          const policy = getDefaultPolicy(sessionId);
+          const policyEngine = createPolicyEngine(policy, network);
+          const policyDecision = await policyEngine.evaluate(
+            'swap',
+            { slippageBps },
+            0,
+            walletAddress
+          );
+          
+          // Store the pending transfer info for follow-up
+          const pendingTransferInfo = {
+            recipient: transferOp.recipient,
+            tokenAddress: swapOp.tokenOut,
+            tokenSymbol: swapOp.tokenOutSymbol,
+            estimatedAmount: estimatedOutput,
+          };
+          
+          return {
+            message: {
+              id: generateId(),
+              sessionId,
+              role: 'assistant',
+              content,
+              intent: swapIntent,
+              createdAt: new Date().toISOString(),
+            },
+            intent: swapIntent,
+            requiresFollowUp: false,
+            transactionPreview: preview,
+            policyDecision,
+            isBatchSwap: true,
+            batchSwapDetails: {
+              tokenIn: swapOp.tokenIn || null,
+              tokenInSymbol: swapOp.tokenInSymbol || 'Token',
+              tokenOut: swapOp.tokenOut || null,
+              tokenOutSymbol: swapOp.tokenOutSymbol || 'Token',
+              amountIn: swapOp.amount || '0',
+              minAmountOut: swapResult.quote.amountOutMin,
+              estimatedAmountOut: estimatedOutput,
+              slippageBps,
+              swapData: swapResult.preparedTx.data,
+            },
+            // Store pending transfer for automatic follow-up
+            _pendingLinkedTransfer: pendingTransferInfo,
+          };
+        }
+      }
+
+      // Build operation descriptions and prepare batch (for non-linked operations)
       const opDescriptions: string[] = [];
       const batchOps: Array<{
         type: 'transfer' | 'swap';
@@ -1527,10 +1695,27 @@ async function buildResponse(
       const policyEngine = createPolicyEngine(policy, network);
       const policyDecision = await policyEngine.evaluate(
         'batch',
-        { operationCount: processedOperations.length },
+        {}, // Batch operations are evaluated individually
         0,
         walletAddress
       );
+
+      // Create a synthetic transaction preview for the batch
+      // This is needed because the UI shows confirm button based on transactionPreview
+      const batchPreview: TransactionPreview = {
+        type: 'contract_call',
+        from: walletAddress,
+        to: batchExecutorAddress || '',
+        network,
+        methodName: 'executeBatch', // Batch execution method
+        nativeValue: '0',
+        estimatedGas: '500000',
+        preparedTx: {
+          to: batchExecutorAddress || '',
+          data: '0x', // Will be built during signing
+          value: '0',
+        },
+      };
 
       return {
         message: {
@@ -1543,6 +1728,7 @@ async function buildResponse(
         },
         intent,
         requiresFollowUp: false,
+        transactionPreview: batchPreview, // Include preview so UI shows confirm button
         policyDecision,
         // Multi-operation batch
         isMultiOpBatch: true,

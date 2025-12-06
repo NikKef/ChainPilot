@@ -1,0 +1,11 @@
+{
+  "network": "bscTestnet",
+  "networkType": "testnet",
+  "chainId": 97,
+  "contractAddress": "0xe109A69825d8D8a15776788d34fA1FB49ED115De",
+  "deployerAddress": "0x8F3143E51Ed4Ee1Ab662CB50BB8B84E520D9D980",
+  "facilitatorAddress": "0x8F3143E51Ed4Ee1Ab662CB50BB8B84E520D9D980",
+  "transactionHash": "0x55d6e8a2935bcc8c015f793241629b391ae8e346fa2624360d9bf501e50194c6",
+  "domainSeparator": "0x3e0da2007f45f7cbdd4475665d426f4d7a777037cb80ec85f41d9349a3c380dd",
+  "deployedAt": "2025-12-05T16:32:37.135Z"
+}

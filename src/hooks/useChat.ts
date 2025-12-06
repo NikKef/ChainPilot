@@ -127,6 +127,12 @@ export function useChat({
     estimatedSwapOutput: string;
     swapOutputToken: { address: string | null; symbol: string; decimals: number } | null;
   } | null>(null);
+  const [pendingLinkedTransfer, setPendingLinkedTransfer] = useState<{
+    recipient?: string;
+    tokenAddress?: string | null;
+    tokenSymbol?: string;
+    estimatedAmount: string;
+  } | null>(null);
   
   const abortControllerRef = useRef<AbortController | null>(null);
   const loadedConversationRef = useRef<string | null>(null);
@@ -190,6 +196,64 @@ export function useChat({
 
   const sendMessage = useCallback(async (content: string) => {
     if (!content.trim() || isLoading) return;
+
+    // Check if user wants to continue with pending linked transfer
+    const continueKeywords = ['continue', 'transfer', 'yes', 'proceed', 'go ahead', 'send', 'ok', 'okay'];
+    const wantsToContinue = pendingLinkedTransfer && 
+      continueKeywords.some(kw => content.toLowerCase().includes(kw));
+    
+    if (wantsToContinue && pendingLinkedTransfer) {
+      console.log('[Chat] User wants to continue with linked transfer:', pendingLinkedTransfer);
+      
+      // Add user message
+      const userMessage: ChatMessage = {
+        id: `msg_${Date.now()}_user`,
+        sessionId,
+        conversationId: currentConversationId,
+        role: 'user',
+        content,
+        createdAt: new Date().toISOString(),
+      };
+      setMessages(prev => [...prev, userMessage]);
+      setIsLoading(true);
+      
+      // Initiate the transfer
+      try {
+        const transferResponse = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            message: `transfer ${pendingLinkedTransfer.estimatedAmount} ${pendingLinkedTransfer.tokenSymbol} to ${pendingLinkedTransfer.recipient}`,
+            sessionId,
+            conversationId: currentConversationId,
+            walletAddress: signerAddress,
+            network: 'testnet', // TODO: get from context
+          }),
+        });
+        
+        const data = await transferResponse.json();
+        
+        // Clear the pending linked transfer
+        setPendingLinkedTransfer(null);
+        
+        // Add assistant message
+        setMessages(prev => [...prev, data.message]);
+        
+        // Handle transaction preview if present
+        if (data.transactionPreview) {
+          setPendingTransaction(data.transactionPreview);
+          setPolicyDecision(data.policyDecision || null);
+        }
+        
+        setIsLoading(false);
+        return;
+      } catch (err) {
+        console.error('[Chat] Error initiating linked transfer:', err);
+        setPendingLinkedTransfer(null);
+        setIsLoading(false);
+        return;
+      }
+    }
 
     // Cancel any pending request
     if (abortControllerRef.current) {
@@ -272,6 +336,13 @@ export function useChat({
           setIsDirectTransaction(false);
           setIsSwapApproval(false);
           setIsMultiOpBatch(false);
+          // Check for pending linked transfer (swap + transfer flow)
+          if (data._pendingLinkedTransfer) {
+            console.log('[Chat] Pending linked transfer detected:', data._pendingLinkedTransfer);
+            setPendingLinkedTransfer(data._pendingLinkedTransfer);
+          } else {
+            setPendingLinkedTransfer(null);
+          }
         }
         // Check for multi-operation batch (swap + transfer in one tx)
         else if (data.isMultiOpBatch && data.multiOpBatchDetails) {
@@ -322,7 +393,7 @@ export function useChat({
     } finally {
       setIsLoading(false);
     }
-  }, [sessionId, currentConversationId, isLoading, onError, onConversationCreated]);
+  }, [sessionId, currentConversationId, isLoading, onError, onConversationCreated, pendingLinkedTransfer, signerAddress]);
 
   const confirmTransaction = useCallback(async () => {
     console.log('[Chat] confirmTransaction called');
@@ -783,6 +854,35 @@ export function useChat({
             estimatedValueUsd: pendingTransaction.valueUsd ? parseFloat(pendingTransaction.valueUsd) : undefined,
           });
           
+          // Check if there's a pending linked transfer
+          if (pendingLinkedTransfer) {
+            console.log('[Chat] Swap complete, prompting for linked transfer:', pendingLinkedTransfer);
+            
+            setMessages(prev => {
+              const filtered = prev.filter(m => !m.content.includes('sign') && !m.content.includes('confirm'));
+              const recipientDisplay = pendingLinkedTransfer.recipient 
+                ? `${pendingLinkedTransfer.recipient.slice(0, 10)}...${pendingLinkedTransfer.recipient.slice(-8)}`
+                : 'recipient';
+              return [...filtered, {
+                id: `msg_${Date.now()}_tx`,
+                sessionId,
+                role: 'assistant',
+                content: `✅ **Step 1 Complete!** Swap executed successfully (Gas-free)\n\n🔗 [View on Explorer](https://${pendingTransaction.network === 'mainnet' ? 'bscscan.com' : 'testnet.bscscan.com'}/tx/${executeResult.result.txHash})\n\n---\n\n**Step 2**: Now let's transfer ~${pendingLinkedTransfer.estimatedAmount} ${pendingLinkedTransfer.tokenSymbol || 'tokens'} to ${recipientDisplay}\n\nSay **"continue"** or **"transfer"** to proceed with the transfer.`,
+                createdAt: new Date().toISOString(),
+              }];
+            });
+            
+            onTransactionSuccess?.(executeResult.result.txHash);
+            
+            // Reset batch swap state but keep pendingLinkedTransfer for the next step
+            setPendingTransaction(null);
+            setPolicyDecision(null);
+            setIsBatchSwap(false);
+            setBatchSwapDetails(null);
+            setIsLoading(false);
+            return;
+          }
+          
           setMessages(prev => {
             const filtered = prev.filter(m => !m.content.includes('sign') && !m.content.includes('confirm'));
             return [...filtered, {
@@ -803,6 +903,7 @@ export function useChat({
         setPolicyDecision(null);
         setIsBatchSwap(false);
         setBatchSwapDetails(null);
+        setPendingLinkedTransfer(null);
         setIsLoading(false);
         return;
       }
@@ -1138,7 +1239,7 @@ export function useChat({
     } finally {
       setIsLoading(false);
     }
-  }, [pendingTransaction, policyDecision, sessionId, provider, signerAddress, lastUserMessage, pendingTransferId, pendingSwapId, isSwapApproval, isDirectTransaction, isBatchSwap, batchSwapDetails, isMultiOpBatch, multiOpBatchDetails, onError, onTransactionSuccess, prepareAndSign, resetQ402]);
+  }, [pendingTransaction, policyDecision, sessionId, provider, signerAddress, lastUserMessage, pendingTransferId, pendingSwapId, isSwapApproval, isDirectTransaction, isBatchSwap, batchSwapDetails, isMultiOpBatch, multiOpBatchDetails, pendingLinkedTransfer, onError, onTransactionSuccess, prepareAndSign, resetQ402]);
 
   const rejectTransaction = useCallback(async () => {
     // Log cancelled transaction to activity

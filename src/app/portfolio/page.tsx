@@ -63,6 +63,7 @@ export default function PortfolioPage() {
     if (isConnected && isCorrectNetwork && address) {
       fetchPortfolio();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isConnected, isCorrectNetwork, address, network]);
 
   // Show connect wallet prompt if not connected

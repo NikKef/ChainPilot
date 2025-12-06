@@ -128,6 +128,10 @@ Optional: args (array of arguments), value (for payable functions)`,
   deploy: `Extract deploy intent. User wants to deploy a previously generated contract.
 Required: contractId (UUID of generated contract)
 Optional: constructorArgs (array)`,
+
+  batch: `Extract batch intent. User wants to perform multiple operations in a single transaction.
+Required: operations (array of operation objects with type: 'transfer' | 'swap' | 'call')
+Each operation should include the required fields for its type.`,
 };
 
 /**

@@ -71,8 +71,9 @@ export class BatchSignatureVerifier {
    * Get the EIP-712 types for BatchWitness
    */
   getTypes() {
+    // Create a mutable copy for verifyTypedData compatibility
     return {
-      BatchWitness: BATCH_WITNESS_TYPES.BatchWitness,
+      BatchWitness: [...BATCH_WITNESS_TYPES.BatchWitness] as { name: string; type: string }[],
     };
   }
 

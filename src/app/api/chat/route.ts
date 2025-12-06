@@ -10,14 +10,15 @@ import {
   getTokenInfo 
 } from '@/lib/services/web3';
 import { createAdminClient } from '@/lib/supabase/server';
-import type { 
-  ChatRequest, 
-  ChatResponse, 
-  Intent,
-  TransferIntent,
-  SwapIntent,
-  TransactionPreview,
-  ChatMessage,
+import { 
+  isIntentComplete,
+  type ChatRequest, 
+  type ChatResponse, 
+  type Intent,
+  type TransferIntent,
+  type SwapIntent,
+  type TransactionPreview,
+  type ChatMessage,
 } from '@/lib/types';
 import { formatErrorResponse, getErrorStatusCode, ValidationError } from '@/lib/utils/errors';
 import { validateChatMessage, isValidNetwork } from '@/lib/utils/validation';
@@ -104,9 +105,54 @@ export async function POST(request: NextRequest) {
       // Don't throw - continue with the chat
     }
 
-    // Parse user intent
-    const intentParser = createIntentParser(body.sessionId, network, walletAddress);
-    const extractionResult = await intentParser.parse(body.message);
+    // Load recent conversation context to support follow-ups
+    const { data: recentMessages } = await supabase
+      .from('chat_messages')
+      .select('role, content, intent, created_at')
+      .eq('conversation_id', conversationId)
+      .order('created_at', { ascending: false })
+      .limit(10);
+
+    let partialIntent: Partial<Intent> | undefined;
+    let chatHistory: { role: 'user' | 'assistant'; content: string }[] | undefined;
+
+    if (recentMessages && recentMessages.length > 0) {
+      chatHistory = recentMessages
+        .map((msg) => ({
+          role: msg.role as 'user' | 'assistant',
+          content: msg.content,
+        }))
+        .reverse(); // Oldest to newest for context
+
+      const lastAssistantWithIntent = recentMessages.find(
+        (msg) => msg.role === 'assistant' && msg.intent
+      );
+
+      if (lastAssistantWithIntent?.intent) {
+        try {
+          const parsedIntent =
+            typeof lastAssistantWithIntent.intent === 'string'
+              ? (JSON.parse(lastAssistantWithIntent.intent) as Intent)
+              : (lastAssistantWithIntent.intent as Intent);
+
+          if (parsedIntent && !isIntentComplete(parsedIntent)) {
+            partialIntent = parsedIntent;
+          }
+        } catch (error) {
+          logger.warn('Failed to parse intent from history', error);
+        }
+      }
+    }
+
+    // Parse user intent (or follow-up)
+    const intentParser = createIntentParser(body.sessionId, network, walletAddress, {
+      partialIntent,
+      chatHistory,
+    });
+
+    const extractionResult = partialIntent
+      ? await intentParser.processFollowUp(body.message)
+      : await intentParser.parse(body.message);
 
     // Build response based on intent
     const response = await buildResponse(

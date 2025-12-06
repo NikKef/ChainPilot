@@ -68,6 +68,13 @@ export class IntentParser {
       const resolved = this.resolveTokenSymbol(intent.tokenSymbol);
       if (resolved) {
         (intent as TransferIntent).tokenAddress = resolved;
+      } else if (intent.tokenSymbol.toUpperCase() !== 'BNB') {
+        this.markUnknownToken(
+          intent.tokenSymbol,
+          result,
+          'tokenAddress',
+          `I couldn't find ${intent.tokenSymbol} on ${this.sessionContext.network}. Please provide the contract address.`
+        );
       }
     }
 
@@ -75,6 +82,13 @@ export class IntentParser {
       const resolved = this.resolveTokenSymbol(intent.tokenInSymbol);
       if (resolved) {
         (intent as SwapIntent).tokenIn = resolved;
+      } else if (intent.tokenInSymbol.toUpperCase() !== 'BNB') {
+        this.markUnknownToken(
+          intent.tokenInSymbol,
+          result,
+          'tokenIn',
+          `I couldn't find ${intent.tokenInSymbol} on ${this.sessionContext.network}. Please provide the token address for the token you're swapping from.`
+        );
       }
     }
 
@@ -82,6 +96,13 @@ export class IntentParser {
       const resolved = this.resolveTokenSymbol(intent.tokenOutSymbol);
       if (resolved) {
         (intent as SwapIntent).tokenOut = resolved;
+      } else if (intent.tokenOutSymbol.toUpperCase() !== 'BNB') {
+        this.markUnknownToken(
+          intent.tokenOutSymbol,
+          result,
+          'tokenOut',
+          `I couldn't find ${intent.tokenOutSymbol} on ${this.sessionContext.network}. Please provide the token address for the token you're swapping to.`
+        );
       }
     }
 
@@ -134,6 +155,25 @@ export class IntentParser {
     }
 
     return null;
+  }
+
+  /**
+   * Handle unknown token symbols by asking for a contract address
+   */
+  private markUnknownToken(
+    symbol: string,
+    result: ContextExtractionResult,
+    missingField: string,
+    question: string
+  ) {
+    if (!result.missingFields.includes(missingField)) {
+      result.missingFields.push(missingField);
+    }
+    if (!result.questions.includes(question)) {
+      result.questions.push(question);
+    }
+    result.requiresFollowUp = true;
+    logger.warn('Unknown token symbol', { symbol, network: this.sessionContext.network });
   }
 
   /**
@@ -223,8 +263,22 @@ export class IntentParser {
       const address = addressMatch[1];
       
       // Determine which field needs this address
-      if (partialIntent.type === 'transfer' && !('to' in partialIntent && partialIntent.to)) {
-        return { to: address };
+      if (partialIntent.type === 'transfer') {
+        if (!('to' in partialIntent && partialIntent.to)) {
+          return { to: address };
+        }
+        if (!('tokenAddress' in partialIntent && (partialIntent as Partial<TransferIntent>).tokenAddress)) {
+          return { tokenAddress: address };
+        }
+      }
+      if (partialIntent.type === 'swap') {
+        const swapIntent = partialIntent as Partial<SwapIntent>;
+        if (swapIntent.tokenInSymbol && !swapIntent.tokenIn) {
+          return { tokenIn: address };
+        }
+        if (swapIntent.tokenOutSymbol && !swapIntent.tokenOut) {
+          return { tokenOut: address };
+        }
       }
       if (partialIntent.type === 'contract_call' && !('contractAddress' in partialIntent && partialIntent.contractAddress)) {
         return { contractAddress: address };
@@ -391,12 +445,14 @@ export class IntentParser {
 export function createIntentParser(
   sessionId: string,
   network: NetworkType,
-  walletAddress?: string
+  walletAddress?: string,
+  contextOverrides?: Partial<SessionContext>
 ): IntentParser {
   return new IntentParser({
     sessionId,
     network,
     walletAddress,
+    ...contextOverrides,
   });
 }
 

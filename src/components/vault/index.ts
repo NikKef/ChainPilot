@@ -1,0 +1,2 @@
+export { VaultPanel } from './VaultPanel';
+

@@ -1,9 +1,10 @@
 'use client';
 
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { BrowserProvider, parseEther } from 'ethers';
+import { BrowserProvider, parseEther, formatEther } from 'ethers';
 import type { ChatMessage, ChatResponse, TransactionPreview, PolicyEvaluationResult } from '@/lib/types';
 import { useQ402 } from './useQ402';
+import { getNativeBalance } from '@/lib/services/web3/provider';
 
 /**
  * Check if a transaction is a native BNB transfer (not a contract interaction)
@@ -243,7 +244,34 @@ export function useChat({
       // Check if this is a native BNB transfer - must be executed directly by user
       if (isNativeBnbTransfer(pendingTransaction)) {
         console.log('[Chat] Native BNB transfer detected - executing directly from user wallet');
-        
+
+        // Check balance before proceeding
+        if (signerAddress) {
+          const balance = await getNativeBalance(signerAddress, pendingTransaction.network);
+          const transferAmount = BigInt(pendingTransaction.nativeValue || '0');
+          const estimatedGas = BigInt(pendingTransaction.estimatedGas || '21000');
+          const gasPrice = BigInt(pendingTransaction.estimatedGasPrice || '5000000000'); // 5 gwei fallback
+          const gasCost = estimatedGas * gasPrice;
+          const totalCost = transferAmount + gasCost;
+
+          if (balance < totalCost) {
+            const balanceFormatted = formatEther(balance);
+            const costFormatted = formatEther(totalCost);
+            const gasCostFormatted = formatEther(gasCost);
+
+            setMessages(prev => [...prev, {
+              id: `msg_${Date.now()}_error`,
+              sessionId,
+              role: 'assistant',
+              content: `❌ Insufficient balance for transfer\n\n**Required:** ${costFormatted} BNB\n**Available:** ${balanceFormatted} BNB\n**Transfer:** ${formatEther(transferAmount)} BNB\n**Gas Cost:** ${gasCostFormatted} BNB\n\nPlease add more BNB to your wallet and try again.`,
+              createdAt: new Date().toISOString(),
+            }]);
+            setPendingTransaction(null);
+            setIsLoading(false);
+            return;
+          }
+        }
+
         // Add signing prompt message
         setMessages(prev => [...prev, {
           id: `msg_${Date.now()}_signing`,
@@ -257,7 +285,7 @@ export function useChat({
         const signer = await provider.getSigner();
         const tx = await signer.sendTransaction({
           to: pendingTransaction.preparedTx.to,
-          value: parseEther(pendingTransaction.nativeValue || '0'),
+          value: BigInt(pendingTransaction.nativeValue || '0'),
           data: pendingTransaction.preparedTx.data || '0x',
         });
         
@@ -363,16 +391,31 @@ export function useChat({
     } catch (err) {
       console.error('[Chat] Transaction error:', err);
       const error = err instanceof Error ? err : new Error('Transaction failed');
+
+      // Provide more specific error messages for common issues
+      let errorMessage = error.message;
+      if (error.message.includes('CALL_EXCEPTION') || error.message.includes('missing revert data')) {
+        if (error.message.includes('missing revert data')) {
+          errorMessage = 'Transaction would fail - likely insufficient balance or invalid recipient';
+        } else {
+          errorMessage = 'Transaction execution failed - please check your balance and try again';
+        }
+      } else if (error.message.includes('insufficient funds')) {
+        errorMessage = 'Insufficient funds to cover transaction and gas fees';
+      } else if (error.message.includes('user rejected')) {
+        errorMessage = 'Transaction cancelled by user';
+      }
+
       setError(error);
       onError?.(error);
 
       setMessages(prev => {
-        const filtered = prev.filter(m => !m.content.includes('Please sign the transaction'));
+        const filtered = prev.filter(m => !m.content.includes('Please sign the transaction') && !m.content.includes('Please confirm the transaction'));
         return [...filtered, {
           id: `msg_${Date.now()}_error`,
           sessionId,
           role: 'assistant',
-          content: `❌ Transaction failed: ${error.message}`,
+          content: `❌ Transaction failed: ${errorMessage}`,
           createdAt: new Date().toISOString(),
         }];
       });

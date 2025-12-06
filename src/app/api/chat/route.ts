@@ -25,6 +25,26 @@ import { validateChatMessage, isValidNetwork } from '@/lib/utils/validation';
 import { logger } from '@/lib/utils';
 import { type NetworkType } from '@/lib/utils/constants';
 
+function intentNeedsFollowUp(intent: Intent): boolean {
+  // Base check using required fields
+  if (!isIntentComplete(intent)) return true;
+
+  // Additional heuristics for symbol-only tokens
+  if (intent.type === 'transfer') {
+    const t = intent as TransferIntent;
+    if (t.tokenSymbol && !t.tokenAddress) return true;
+  }
+
+  if (intent.type === 'swap') {
+    const s = intent as SwapIntent;
+    if ((s.tokenInSymbol && !s.tokenIn) || (s.tokenOutSymbol && !s.tokenOut)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 // Extended chat request with conversation support
 interface ExtendedChatRequest extends ChatRequest {
   conversationId?: string;
@@ -135,7 +155,7 @@ export async function POST(request: NextRequest) {
               ? (JSON.parse(lastAssistantWithIntent.intent) as Intent)
               : (lastAssistantWithIntent.intent as Intent);
 
-          if (parsedIntent && !isIntentComplete(parsedIntent)) {
+          if (parsedIntent && intentNeedsFollowUp(parsedIntent)) {
             partialIntent = parsedIntent;
           }
         } catch (error) {

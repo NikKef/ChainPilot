@@ -140,9 +140,17 @@ ${prompt}
 
 IMPORTANT: Return ONLY valid JSON. Do not include any text before or after the JSON object.`;
 
+    const history =
+      sessionContext.chatHistory && sessionContext.chatHistory.length
+        ? sessionContext.chatHistory.map((m) => ({
+            role: m.role,
+            content: m.content,
+          }))
+        : 'off';
+
     const response = await client.createChatBlob({
       question: fullQuestion,
-      chatHistory: 'off',
+      chatHistory: history,
       useCustomContext: false,
     });
 

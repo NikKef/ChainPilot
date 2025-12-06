@@ -1173,7 +1173,20 @@ async function buildResponse(
           // If tokenOut is missing but symbol is NOT BNB (e.g., "ETH"), we need to ask for the address
           if (!singleOp.tokenOut && !isExplicitlyNativeBNB && singleOp.tokenOutSymbol) {
             const content = `${singleOp.tokenOutSymbol} is available on mainnet but not on testnet. If you have a testnet version of this token, please provide its contract address.\n\n` +
-              `**Intent**: swap ${singleOp.tokenIn || ''} for ${singleOp.tokenOutSymbol}`;
+              `**Intent**: swap ${singleOp.tokenInSymbol || 'Token'} for ${singleOp.tokenOutSymbol}`;
+            
+            // Build a proper partial swap intent that will be stored in the message
+            // This is essential for follow-up processing to work correctly
+            const partialSwapIntent: SwapIntent = {
+              type: 'swap',
+              network,
+              tokenIn: singleOp.tokenIn,
+              tokenInSymbol: singleOp.tokenInSymbol,
+              tokenOut: undefined, // Missing - needs follow-up
+              tokenOutSymbol: singleOp.tokenOutSymbol,
+              amount: singleOp.amount || '0',
+              slippageBps: singleOp.slippageBps || 300,
+            };
             
             return {
               message: {
@@ -1181,19 +1194,12 @@ async function buildResponse(
                 sessionId,
                 role: 'assistant',
                 content,
-                intent: { type: 'swap' },
+                intent: partialSwapIntent, // Store full partial intent, not just { type: 'swap' }
                 createdAt: new Date().toISOString(),
               },
-              intent: { type: 'swap' },
+              intent: partialSwapIntent,
               requiresFollowUp: true,
-              partialIntent: {
-                type: 'swap',
-                tokenIn: singleOp.tokenIn,
-                tokenInSymbol: singleOp.tokenInSymbol,
-                tokenOutSymbol: singleOp.tokenOutSymbol,
-                amount: singleOp.amount,
-                unresolvedSymbol: singleOp.tokenOutSymbol,
-              },
+              partialIntent: partialSwapIntent,
             };
           }
           

@@ -11,7 +11,8 @@ export type IntentType =
   | 'transfer'
   | 'swap'
   | 'contract_call'
-  | 'deploy';
+  | 'deploy'
+  | 'batch';
 
 /**
  * Base intent structure
@@ -102,6 +103,42 @@ export interface DeployIntent extends BaseIntent {
 }
 
 /**
+ * Batch operation for batch intent
+ */
+export interface BatchOperation {
+  type: 'transfer' | 'swap' | 'call';
+  // For transfers
+  tokenAddress?: string | null;
+  tokenSymbol?: string;
+  recipient?: string;
+  amount?: string;
+  // For swaps
+  tokenIn?: string | null;
+  tokenInSymbol?: string;
+  tokenOut?: string | null;
+  tokenOutSymbol?: string;
+  slippageBps?: number;
+  swapRecipient?: string; // If set, swap output goes here instead of user
+  // For calls
+  contractAddress?: string;
+  method?: string;
+  args?: unknown[];
+  value?: string;
+  data?: string;
+  // Special flags
+  _usesPreviousOutput?: boolean; // Transfer uses output from previous operation
+}
+
+/**
+ * Batch intent - Multiple operations in one sign-to-pay flow
+ */
+export interface BatchIntent extends BaseIntent {
+  type: 'batch';
+  operations: BatchOperation[];
+  description?: string;
+}
+
+/**
  * Union of all intent types
  */
 export type Intent =
@@ -112,7 +149,8 @@ export type Intent =
   | TransferIntent
   | SwapIntent
   | ContractCallIntent
-  | DeployIntent;
+  | DeployIntent
+  | BatchIntent;
 
 /**
  * Result of context extraction from ChainGPT
@@ -166,6 +204,7 @@ export const INTENT_REQUIRED_FIELDS: Record<IntentType, string[]> = {
   swap: ['tokenIn', 'tokenOut', 'amount'],
   contract_call: ['contractAddress', 'method'],
   deploy: ['contractId'],
+  batch: ['operations'], // At least one operation required
 };
 
 /**

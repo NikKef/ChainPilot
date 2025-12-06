@@ -368,3 +368,194 @@ export function isAddressAllowed(
   return { allowed: true };
 }
 
+/**
+ * Batch operation context for policy evaluation
+ */
+export interface BatchOperationContext {
+  type: 'transfer' | 'swap' | 'call';
+  tokenAddress?: string;
+  targetAddress?: string;
+  valueUsd?: number;
+  slippageBps?: number;
+}
+
+/**
+ * Batch policy evaluation context
+ */
+export interface BatchPolicyEvaluationContext {
+  policy: PolicyWithLists;
+  operations: BatchOperationContext[];
+  todaySpendUsd: number;
+  userAddress: string;
+}
+
+/**
+ * Batch policy evaluation result
+ */
+export interface BatchPolicyEvaluationResult extends PolicyEvaluationResult {
+  operationResults: Array<{
+    index: number;
+    allowed: boolean;
+    riskLevel: RiskLevel;
+    violations: PolicyViolation[];
+    warnings: PolicyViolation[];
+  }>;
+  totalValueUsd: number;
+}
+
+/**
+ * Evaluate a batch of operations against user policies
+ * 
+ * Evaluates each operation individually and aggregates results.
+ * The batch is only allowed if all operations are allowed.
+ */
+export function evaluateBatchPolicy(
+  context: BatchPolicyEvaluationContext
+): BatchPolicyEvaluationResult {
+  const operationResults: BatchPolicyEvaluationResult['operationResults'] = [];
+  const allViolations: PolicyViolation[] = [];
+  const allWarnings: PolicyViolation[] = [];
+  let maxRiskLevel: RiskLevel = 'LOW';
+  let totalValueUsd = 0;
+  let runningTodaySpend = context.todaySpendUsd;
+
+  const securityLevel: SecurityLevel = context.policy.securityLevel || 'NORMAL';
+
+  logger.policyEval('evaluating batch', { 
+    operationCount: context.operations.length,
+    securityLevel,
+  });
+
+  // Maximum operations per batch
+  const MAX_BATCH_OPERATIONS = 10;
+  if (context.operations.length > MAX_BATCH_OPERATIONS) {
+    allViolations.push({
+      type: 'exceeds_batch_limit',
+      message: `Batch contains ${context.operations.length} operations, maximum allowed is ${MAX_BATCH_OPERATIONS}`,
+      severity: 'blocking',
+    });
+    maxRiskLevel = 'BLOCKED';
+  }
+
+  // Evaluate each operation
+  for (let i = 0; i < context.operations.length; i++) {
+    const op = context.operations[i];
+    const opViolations: PolicyViolation[] = [];
+    const opWarnings: PolicyViolation[] = [];
+    let opRiskLevel: RiskLevel = 'LOW';
+
+    // Track total value
+    if (op.valueUsd) {
+      totalValueUsd += op.valueUsd;
+    }
+
+    // Evaluate operation based on type
+    const transactionType = op.type === 'call' ? 'contract_call' : op.type;
+    
+    const opContext: PolicyEvaluationContext = {
+      transactionType,
+      policy: context.policy,
+      targetAddress: op.targetAddress,
+      tokenAddress: op.tokenAddress,
+      valueUsd: op.valueUsd,
+      todaySpendUsd: runningTodaySpend,
+      slippageBps: op.slippageBps,
+      userAddress: context.userAddress,
+    };
+
+    const opResult = evaluatePolicy(opContext);
+    
+    // Update running daily spend for subsequent operations
+    if (op.valueUsd) {
+      runningTodaySpend += op.valueUsd;
+    }
+
+    // Collect violations and warnings
+    opViolations.push(...opResult.violations);
+    opWarnings.push(...opResult.warnings);
+    opRiskLevel = opResult.riskLevel;
+
+    // Track max risk level across all operations
+    if (opRiskLevel === 'BLOCKED') {
+      maxRiskLevel = 'BLOCKED';
+    } else if (opRiskLevel === 'HIGH' && maxRiskLevel !== 'BLOCKED') {
+      maxRiskLevel = 'HIGH';
+    } else if (opRiskLevel === 'MEDIUM' && maxRiskLevel === 'LOW') {
+      maxRiskLevel = 'MEDIUM';
+    }
+
+    operationResults.push({
+      index: i,
+      allowed: opResult.allowed,
+      riskLevel: opRiskLevel,
+      violations: opViolations,
+      warnings: opWarnings,
+    });
+
+    allViolations.push(...opViolations.map(v => ({
+      ...v,
+      message: `[Operation ${i + 1}] ${v.message}`,
+    })));
+    allWarnings.push(...opWarnings.map(w => ({
+      ...w,
+      message: `[Operation ${i + 1}] ${w.message}`,
+    })));
+  }
+
+  // Check total batch value against per-transaction limit
+  if (context.policy.maxPerTxUsd !== null && totalValueUsd > context.policy.maxPerTxUsd) {
+    allViolations.push({
+      type: 'batch_exceeds_per_tx_limit',
+      message: `Total batch value ($${totalValueUsd.toFixed(2)}) exceeds per-transaction limit ($${context.policy.maxPerTxUsd})`,
+      severity: 'blocking',
+      details: {
+        totalValue: totalValueUsd,
+        limit: context.policy.maxPerTxUsd,
+      },
+    });
+    maxRiskLevel = 'BLOCKED';
+  }
+
+  // Check total batch value against daily limit
+  if (context.policy.maxDailyUsd !== null) {
+    const finalDailyTotal = context.todaySpendUsd + totalValueUsd;
+    if (finalDailyTotal > context.policy.maxDailyUsd) {
+      allViolations.push({
+        type: 'batch_exceeds_daily_limit',
+        message: `This batch would exceed your daily limit ($${context.policy.maxDailyUsd}). Today's spend: $${context.todaySpendUsd.toFixed(2)}, batch total: $${totalValueUsd.toFixed(2)}`,
+        severity: 'blocking',
+        details: {
+          todaySpend: context.todaySpendUsd,
+          batchValue: totalValueUsd,
+          dailyLimit: context.policy.maxDailyUsd,
+        },
+      });
+      maxRiskLevel = 'BLOCKED';
+    }
+  }
+
+  const allOperationsAllowed = operationResults.every(r => r.allowed);
+  const allowed = allOperationsAllowed && allViolations.length === 0;
+
+  const result: BatchPolicyEvaluationResult = {
+    allowed,
+    riskLevel: maxRiskLevel,
+    violations: allViolations,
+    warnings: allWarnings,
+    reasons: allViolations.map(v => v.message),
+    operationResults,
+    totalValueUsd,
+  };
+
+  logger.policyEval('batch evaluation complete', {
+    allowed: result.allowed,
+    riskLevel: result.riskLevel,
+    operationCount: context.operations.length,
+    totalValueUsd,
+    violationCount: allViolations.length,
+    warningCount: allWarnings.length,
+  });
+
+  return result;
+}
+

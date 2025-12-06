@@ -40,12 +40,14 @@ export const Q402_CONTRACTS = {
     verifier: process.env.Q402_VERIFIER_TESTNET || '0x0000000000000000000000000000000000000002', // EIP-712 Verifying Contract
     facilitatorWallet: process.env.Q402_FACILITATOR_WALLET_TESTNET || '0x0000000000000000000000000000000000000003', // Gas sponsor wallet
     vault: process.env.Q402_VAULT_TESTNET || '', // Q402 Vault Contract for deposits
+    batchExecutor: process.env.Q402_BATCH_EXECUTOR_TESTNET || '', // Q402 BatchExecutor for gas-sponsored batches
   },
   mainnet: {
     implementation: process.env.Q402_IMPLEMENTATION_MAINNET || '0x0000000000000000000000000000000000000001',
     verifier: process.env.Q402_VERIFIER_MAINNET || '0x0000000000000000000000000000000000000002',
     facilitatorWallet: process.env.Q402_FACILITATOR_WALLET_MAINNET || '0x0000000000000000000000000000000000000003',
     vault: process.env.Q402_VAULT_MAINNET || '', // Q402 Vault Contract for deposits
+    batchExecutor: process.env.Q402_BATCH_EXECUTOR_MAINNET || '', // Q402 BatchExecutor for gas-sponsored batches
   },
 } as const;
 
@@ -170,4 +172,54 @@ export const PANCAKE_ROUTER_ABI = [
   'function getAmountsIn(uint amountOut, address[] calldata path) external view returns (uint[] memory amounts)',
   'function WETH() external pure returns (address)',
 ];
+
+// Q402 BatchExecutor ABI (for gas-sponsored batch operations)
+export const Q402_BATCH_EXECUTOR_ABI = [
+  // Main execution function
+  'function executeBatch((address owner, bytes32 operationsHash, uint256 deadline, bytes32 batchId, uint256 nonce) witness, (uint8 opType, address tokenIn, uint256 amountIn, address tokenOut, uint256 minAmountOut, address target, bytes data)[] operations, bytes signature) external',
+  // View functions
+  'function getNonce(address owner) view returns (uint256)',
+  'function isBatchIdUsed(bytes32 batchId) view returns (bool)',
+  'function isFacilitator(address addr) view returns (bool)',
+  'function isRouterWhitelisted(address router) view returns (bool)',
+  'function isTargetWhitelisted(address target) view returns (bool)',
+  'function domainSeparator() view returns (bytes32)',
+  'function computeOperationsHash((uint8 opType, address tokenIn, uint256 amountIn, address tokenOut, uint256 minAmountOut, address target, bytes data)[] operations) view returns (bytes32)',
+  'function maxOperationsPerBatch() view returns (uint256)',
+  'function paused() view returns (bool)',
+  // Constants
+  'function OP_TRANSFER() view returns (uint8)',
+  'function OP_SWAP() view returns (uint8)',
+  'function OP_CALL() view returns (uint8)',
+  // Events
+  'event BatchExecuted(address indexed owner, bytes32 indexed batchId, uint256 operationCount, uint256 nonce, address facilitator)',
+  'event OperationExecuted(bytes32 indexed batchId, uint256 indexed operationIndex, uint8 opType, address tokenIn, uint256 amountIn, address tokenOut, uint256 amountOut, address target)',
+];
+
+// EIP-712 type definitions for BatchWitness
+export const BATCH_WITNESS_TYPES = {
+  Operation: [
+    { name: 'opType', type: 'uint8' },
+    { name: 'tokenIn', type: 'address' },
+    { name: 'amountIn', type: 'uint256' },
+    { name: 'tokenOut', type: 'address' },
+    { name: 'minAmountOut', type: 'uint256' },
+    { name: 'target', type: 'address' },
+    { name: 'data', type: 'bytes' },
+  ],
+  BatchWitness: [
+    { name: 'owner', type: 'address' },
+    { name: 'operationsHash', type: 'bytes32' },
+    { name: 'deadline', type: 'uint256' },
+    { name: 'batchId', type: 'bytes32' },
+    { name: 'nonce', type: 'uint256' },
+  ],
+} as const;
+
+// Operation types for batch execution
+export const BATCH_OPERATION_TYPES = {
+  TRANSFER: 0,
+  SWAP: 1,
+  CALL: 2,
+} as const;
 

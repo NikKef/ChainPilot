@@ -1,4 +1,4 @@
-import { keccak256, toUtf8Bytes, hexlify, randomBytes, TypedDataDomain, TypedDataField, parseEther, parseUnits, solidityPacked, Contract, JsonRpcProvider } from 'ethers';
+import { keccak256, toUtf8Bytes, hexlify, randomBytes, TypedDataDomain, TypedDataField, parseEther, parseUnits, solidityPacked, Contract, JsonRpcProvider, AbiCoder } from 'ethers';
 import type { PreparedTx } from '@/lib/types';
 import type {
   Q402PaymentRequest,
@@ -14,9 +14,16 @@ import type {
   Q402Network,
   FacilitatorVerifyResponse,
   FacilitatorSettleResponse,
+  BatchOperation,
+  BatchWitness,
+  BatchPaymentRequest,
+  BatchSignedMessage,
+  BatchExecutionRequest,
+  BatchExecutionResult,
+  BATCH_OP_CODES,
 } from './types';
-import { Q402_WITNESS_TYPES, Q402_CONTRACT_ABI } from './types';
-import { NETWORKS, Q402_CONTRACTS, Q402_FACILITATOR, type NetworkType } from '@/lib/utils/constants';
+import { Q402_WITNESS_TYPES, Q402_CONTRACT_ABI, BATCH_WITNESS_TYPES } from './types';
+import { NETWORKS, Q402_CONTRACTS, Q402_FACILITATOR, Q402_BATCH_EXECUTOR_ABI, type NetworkType } from '@/lib/utils/constants';
 import { logger } from '@/lib/utils';
 import { ExternalApiError } from '@/lib/utils/errors';
 import { initializeFacilitator, type SettleRequest } from '@/lib/services/facilitator';
@@ -77,6 +84,17 @@ export interface PendingSwapInfo {
   expiresAt: string;
 }
 
+// Pending batch info stored when approval is needed
+export interface PendingBatchInfo {
+  approvalRequestId: string;
+  sessionId: string;
+  network: string;
+  walletAddress: string;
+  operations: BatchOperation[];
+  createdAt: string;
+  expiresAt: string;
+}
+
 // Declare the global type
 declare global {
   // eslint-disable-next-line no-var
@@ -87,6 +105,10 @@ declare global {
   var __q402_pending_transfers__: Map<string, PendingTransferInfo> | undefined;
   // eslint-disable-next-line no-var
   var __q402_pending_swaps__: Map<string, PendingSwapInfo> | undefined;
+  // eslint-disable-next-line no-var
+  var __q402_batch_request_store__: Map<string, BatchPaymentRequest> | undefined;
+  // eslint-disable-next-line no-var
+  var __q402_pending_batches__: Map<string, PendingBatchInfo> | undefined;
 }
 
 // Get or create the global store
@@ -166,6 +188,50 @@ export function deletePendingSwap(approvalRequestId: string): void {
   const store = getPendingSwapStore();
   store.delete(approvalRequestId);
   console.log('[Q402] Deleted pending swap', { approvalRequestId });
+}
+
+// Get or create the batch request store
+function getBatchRequestStore(): Map<string, BatchPaymentRequest> {
+  if (!globalThis.__q402_batch_request_store__) {
+    globalThis.__q402_batch_request_store__ = new Map<string, BatchPaymentRequest>();
+    console.log('[Q402] Created new batch request store');
+  }
+  return globalThis.__q402_batch_request_store__;
+}
+
+// Get or create the pending batches store
+function getPendingBatchStore(): Map<string, PendingBatchInfo> {
+  if (!globalThis.__q402_pending_batches__) {
+    globalThis.__q402_pending_batches__ = new Map<string, PendingBatchInfo>();
+    console.log('[Q402] Created new pending batch store');
+  }
+  return globalThis.__q402_pending_batches__;
+}
+
+/**
+ * Store a pending batch (called when approval is needed)
+ */
+export function storePendingBatch(info: PendingBatchInfo): void {
+  const store = getPendingBatchStore();
+  store.set(info.approvalRequestId, info);
+  console.log('[Q402] Stored pending batch', { approvalRequestId: info.approvalRequestId });
+}
+
+/**
+ * Get a pending batch by approval request ID
+ */
+export function getPendingBatch(approvalRequestId: string): PendingBatchInfo | undefined {
+  const store = getPendingBatchStore();
+  return store.get(approvalRequestId);
+}
+
+/**
+ * Delete a pending batch after it's been processed
+ */
+export function deletePendingBatch(approvalRequestId: string): void {
+  const store = getPendingBatchStore();
+  store.delete(approvalRequestId);
+  console.log('[Q402] Deleted pending batch', { approvalRequestId });
 }
 
 // Clean up expired requests every 5 minutes (only initialize once)
@@ -973,6 +1039,421 @@ export class Q402Client {
   deleteRequest(requestId: string): void {
     const store = getGlobalRequestStore();
     store.delete(requestId);
+  }
+
+  // =============================================================================
+  // BATCH EXECUTION METHODS
+  // =============================================================================
+
+  /**
+   * Get the BatchExecutor contract address for this network
+   */
+  getBatchExecutorAddress(): string {
+    const network = this.config.network === 'bsc-mainnet' ? 'mainnet' : 'testnet';
+    return Q402_CONTRACTS[network].batchExecutor || '';
+  }
+
+  /**
+   * Get the current nonce for a user from the BatchExecutor contract
+   */
+  async getBatchNonce(userAddress: string): Promise<number> {
+    try {
+      const batchExecutorAddress = this.getBatchExecutorAddress();
+      if (!batchExecutorAddress) {
+        logger.warn('BatchExecutor not deployed, using nonce 0');
+        return 0;
+      }
+
+      const networkConfig = this.config.network === 'bsc-mainnet' 
+        ? NETWORKS.mainnet 
+        : NETWORKS.testnet;
+      
+      const provider = new JsonRpcProvider(networkConfig.rpcUrl);
+      const contract = new Contract(
+        batchExecutorAddress,
+        Q402_BATCH_EXECUTOR_ABI,
+        provider
+      );
+      
+      const nonce = await contract.getNonce(userAddress);
+      const nonceNumber = Number(nonce);
+      
+      logger.q402('Fetched batch nonce', { 
+        userAddress, 
+        nonce: nonceNumber,
+        contract: batchExecutorAddress,
+      });
+      
+      return nonceNumber;
+    } catch (error) {
+      logger.error('Failed to fetch batch nonce from contract', { 
+        userAddress, 
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return 0;
+    }
+  }
+
+  /**
+   * Compute the operations hash the same way the contract does
+   */
+  computeOperationsHash(operations: BatchOperation[]): string {
+    const abiCoder = new AbiCoder();
+    const OPERATION_TYPEHASH = keccak256(
+      toUtf8Bytes('Operation(uint8 opType,address tokenIn,uint256 amountIn,address tokenOut,uint256 minAmountOut,address target,bytes data)')
+    );
+    
+    // Hash each operation
+    const operationHashes: string[] = operations.map(op => {
+      const opTypeCode = this.getOpTypeCode(op.type);
+      const dataHash = keccak256(op.data || '0x');
+      
+      return keccak256(
+        abiCoder.encode(
+          ['bytes32', 'uint8', 'address', 'uint256', 'address', 'uint256', 'address', 'bytes32'],
+          [
+            OPERATION_TYPEHASH,
+            opTypeCode,
+            op.tokenIn,
+            BigInt(op.amountIn),
+            op.tokenOut,
+            BigInt(op.minAmountOut),
+            op.target,
+            dataHash,
+          ]
+        )
+      );
+    });
+    
+    // Combine all operation hashes
+    return keccak256(solidityPacked(['bytes32[]'], [operationHashes]));
+  }
+
+  /**
+   * Convert operation type string to numeric code
+   */
+  private getOpTypeCode(type: string): number {
+    switch (type) {
+      case 'transfer': return 0;
+      case 'swap': return 1;
+      case 'call': return 2;
+      default: return 0;
+    }
+  }
+
+  /**
+   * Generate a unique batch ID
+   */
+  private generateBatchId(): string {
+    const timestamp = Date.now().toString(36);
+    const random = hexlify(randomBytes(16));
+    return keccak256(toUtf8Bytes(`batch_${timestamp}_${random}`));
+  }
+
+  /**
+   * Create a batch payment request
+   */
+  async createBatchPaymentRequest(
+    operations: BatchOperation[],
+    ownerAddress: string,
+    metadata: {
+      action: string;
+      description: string;
+      totalValueUsd?: number;
+    }
+  ): Promise<BatchPaymentRequest> {
+    logger.q402('createBatchPaymentRequest', { 
+      action: metadata.action,
+      operationCount: operations.length,
+    });
+
+    const requestId = this.generateRequestId();
+    const batchId = this.generateBatchId();
+    const now = Date.now();
+    const deadline = now + Q402_FACILITATOR.requestExpiryMs;
+
+    // Get nonce for the owner
+    const nonce = await this.getBatchNonce(ownerAddress);
+
+    // Compute operations hash
+    const operationsHash = this.computeOperationsHash(operations);
+
+    // Create batch witness
+    const witness: BatchWitness = {
+      owner: ownerAddress,
+      operationsHash,
+      deadline: Math.floor(deadline / 1000),
+      batchId,
+      nonce,
+    };
+
+    const request: BatchPaymentRequest = {
+      id: requestId,
+      chainId: this.config.chainId,
+      operations,
+      witness,
+      metadata: {
+        ...metadata,
+        operationCount: operations.length,
+      },
+      policy: {
+        deadline: Math.floor(deadline / 1000),
+        atomicExecution: true,
+      },
+      createdAt: new Date(now).toISOString(),
+      expiresAt: new Date(deadline).toISOString(),
+    };
+
+    // Store request
+    await this.storeBatchRequest(request);
+
+    return request;
+  }
+
+  /**
+   * Create EIP-712 typed data for batch signing
+   */
+  createBatchTypedDataForSigning(request: BatchPaymentRequest): BatchSignedMessage {
+    const batchExecutorAddress = this.getBatchExecutorAddress();
+    
+    const domain = {
+      name: 'q402-batch',
+      version: '1',
+      chainId: this.config.chainId,
+      verifyingContract: batchExecutorAddress || this.config.verifyingContract,
+    };
+
+    const types = {
+      BatchWitness: BATCH_WITNESS_TYPES.BatchWitness.map(field => ({
+        name: field.name,
+        type: field.type,
+      })),
+    };
+
+    logger.q402('Created batch typed data for signing', {
+      requestId: request.id,
+      owner: request.witness.owner,
+      batchId: request.witness.batchId,
+      operationCount: request.operations.length,
+    });
+
+    return {
+      domain,
+      types,
+      primaryType: 'BatchWitness',
+      message: request.witness,
+    };
+  }
+
+  /**
+   * Create ethers-compatible typed data for batch signing
+   */
+  createEthersBatchTypedData(request: BatchPaymentRequest): {
+    domain: TypedDataDomain;
+    types: Record<string, TypedDataField[]>;
+    value: BatchWitness;
+  } {
+    const typedData = this.createBatchTypedDataForSigning(request);
+    
+    return {
+      domain: {
+        name: typedData.domain.name,
+        version: typedData.domain.version,
+        chainId: typedData.domain.chainId,
+        verifyingContract: typedData.domain.verifyingContract,
+      },
+      types: {
+        BatchWitness: typedData.types.BatchWitness.map(field => ({
+          name: field.name,
+          type: field.type,
+        })),
+      },
+      value: typedData.message,
+    };
+  }
+
+  /**
+   * Execute a batch payment request
+   */
+  async executeBatchRequest(
+    requestId: string,
+    signature: string,
+    signerAddress: string
+  ): Promise<BatchExecutionResult> {
+    logger.q402('executeBatchRequest', { requestId });
+
+    try {
+      const request = await this.getBatchRequest(requestId);
+      if (!request) {
+        return {
+          success: false,
+          batchId: '',
+          error: 'Batch request not found',
+        };
+      }
+
+      // Check expiration
+      if (new Date(request.expiresAt) < new Date()) {
+        return {
+          success: false,
+          batchId: request.witness.batchId,
+          error: 'Batch request expired',
+        };
+      }
+
+      // Import and use batch settler
+      const { createBatchTransactionSettler } = await import('@/lib/services/facilitator/batch-settler');
+      
+      const network = this.config.network === 'bsc-mainnet' ? 'mainnet' : 'testnet';
+      const networkConfig = NETWORKS[network];
+      const contracts = Q402_CONTRACTS[network];
+
+      // Get sponsor private key from environment
+      const sponsorPrivateKey = process.env.FACILITATOR_PRIVATE_KEY || '';
+      if (!sponsorPrivateKey) {
+        return {
+          success: false,
+          batchId: request.witness.batchId,
+          error: 'Facilitator not configured',
+        };
+      }
+
+      // Derive sponsor address
+      const { Wallet } = await import('ethers');
+      const sponsorWallet = new Wallet(sponsorPrivateKey);
+      const sponsorAddress = sponsorWallet.address;
+
+      const batchSettler = createBatchTransactionSettler({
+        network: this.config.network,
+        chainId: this.config.chainId,
+        rpcUrl: networkConfig.rpcUrl,
+        sponsorPrivateKey,
+        sponsorAddress,
+        implementationContract: contracts.implementation,
+        verifyingContract: contracts.verifier,
+        batchExecutorContract: contracts.batchExecutor || '',
+        implementationWhitelist: [contracts.implementation],
+        maxGasPriceGwei: Q402_FACILITATOR.gasPolicy.maxGasPriceGwei,
+        maxGasLimit: Q402_FACILITATOR.gasPolicy.maxGasLimit,
+        dailyGasBudgetWei: '1000000000000000000', // 1 BNB
+        perTransactionMaxGasWei: '10000000000000000', // 0.01 BNB
+        maxRequestsPerMinute: 10,
+        maxRequestsPerAddress: 100,
+      });
+
+      // Execute batch
+      const result = await batchSettler.settleBatch({
+        networkId: this.config.network,
+        requestId,
+        witness: request.witness,
+        operations: request.operations,
+        signature,
+        signerAddress,
+      }, false); // Don't skip verification
+
+      if (result.success) {
+        // Clean up stored request
+        this.deleteBatchRequest(requestId);
+
+        return {
+          success: true,
+          batchId: request.witness.batchId,
+          txHash: result.txHash,
+          blockNumber: result.blockNumber,
+          gasUsed: result.gasUsed,
+          operationResults: result.operationResults,
+        };
+      }
+
+      return {
+        success: false,
+        batchId: request.witness.batchId,
+        error: result.error,
+      };
+    } catch (error) {
+      logger.error('Batch execution failed', error);
+      return {
+        success: false,
+        batchId: '',
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
+  }
+
+  /**
+   * Store batch request in global store
+   */
+  private async storeBatchRequest(request: BatchPaymentRequest): Promise<void> {
+    const store = getBatchRequestStore();
+    store.set(request.id, request);
+    logger.q402('Batch request stored', { 
+      requestId: request.id, 
+      storeSize: store.size,
+      operationCount: request.operations.length,
+    });
+  }
+
+  /**
+   * Get batch request from global store
+   */
+  private async getBatchRequest(requestId: string): Promise<BatchPaymentRequest | undefined> {
+    const store = getBatchRequestStore();
+    const request = store.get(requestId);
+    logger.q402('Batch request lookup', { requestId, found: !!request, storeSize: store.size });
+    return request;
+  }
+
+  /**
+   * Delete batch request from store
+   */
+  deleteBatchRequest(requestId: string): void {
+    const store = getBatchRequestStore();
+    store.delete(requestId);
+  }
+
+  /**
+   * Check if user needs to approve BatchExecutor for a token
+   */
+  async checkBatchApprovalNeeded(
+    tokenAddress: string,
+    ownerAddress: string,
+    amount: string
+  ): Promise<{
+    needsApproval: boolean;
+    currentAllowance: bigint;
+    requiredAmount: bigint;
+    batchExecutorAddress: string;
+  }> {
+    const batchExecutorAddress = this.getBatchExecutorAddress();
+    if (!batchExecutorAddress) {
+      return {
+        needsApproval: false,
+        currentAllowance: BigInt(0),
+        requiredAmount: BigInt(0),
+        batchExecutorAddress: '',
+      };
+    }
+
+    const networkConfig = this.config.network === 'bsc-mainnet' 
+      ? NETWORKS.mainnet 
+      : NETWORKS.testnet;
+    
+    const provider = new JsonRpcProvider(networkConfig.rpcUrl);
+    const tokenContract = new Contract(
+      tokenAddress,
+      ['function allowance(address owner, address spender) view returns (uint256)'],
+      provider
+    );
+
+    const currentAllowance = await tokenContract.allowance(ownerAddress, batchExecutorAddress);
+    const requiredAmount = BigInt(amount);
+
+    return {
+      needsApproval: currentAllowance < requiredAmount,
+      currentAllowance,
+      requiredAmount,
+      batchExecutorAddress,
+    };
   }
 }
 

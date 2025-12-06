@@ -1,11 +1,20 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createQ402Service, createTransactionExecutor, getPendingTransfer, deletePendingTransfer } from '@/lib/services/q402';
+import { createQ402Service, createTransactionExecutor, createQ402Client, getPendingTransfer, deletePendingTransfer } from '@/lib/services/q402';
+import type { BatchOperation } from '@/lib/services/q402/types';
 import { getSessionInfo } from '@/lib/services/activity/server';
 import { buildTokenTransfer, createTransactionPreview, getTokenInfo } from '@/lib/services/web3';
 import type { ExecuteTransactionRequest, ExecuteTransactionResponse, ActionLog, TransactionPreview } from '@/lib/types';
 import { formatErrorResponse, getErrorStatusCode, ValidationError } from '@/lib/utils/errors';
 import { logger } from '@/lib/utils';
 import { type NetworkType, NETWORKS } from '@/lib/utils/constants';
+
+/**
+ * Extended execute request with batch support
+ */
+interface ExtendedExecuteRequest extends ExecuteTransactionRequest {
+  isBatch?: boolean;
+  operations?: BatchOperation[];
+}
 
 /**
  * POST /api/transactions/execute
@@ -16,6 +25,8 @@ import { type NetworkType, NETWORKS } from '@/lib/utils/constants';
  * 2. Submits to Q402 facilitator for gas-sponsored execution
  * 3. Returns the transaction hash and execution result
  * 
+ * Supports both single transactions and batch transactions.
+ * 
  * NOTE: Activity logging is handled by the client (useChat hook) which has
  * access to more context like the user message and transaction preview.
  * This avoids duplicate logging.
@@ -24,7 +35,7 @@ export async function POST(request: NextRequest) {
   const startTime = Date.now();
 
   try {
-    const body: ExecuteTransactionRequest = await request.json();
+    const body: ExtendedExecuteRequest = await request.json();
 
     // Validate required fields
     if (!body.sessionId) {
@@ -47,25 +58,62 @@ export async function POST(request: NextRequest) {
       sessionId: body.sessionId,
       actionLogId: body.actionLogId,
       signerAddress: body.signerAddress,
+      isBatch: body.isBatch,
     });
 
     // Get session info to determine network
     const sessionInfo = await getSessionInfo(body.sessionId);
     const network: NetworkType = (body.network as NetworkType) || sessionInfo?.network || 'testnet';
     
-    // Create Q402 service for the network
-    const q402Service = createQ402Service(network);
+    let result: {
+      success: boolean;
+      txHash?: string;
+      blockNumber?: number;
+      gasUsed?: string;
+      error?: string;
+      q402RequestId?: string;
+    };
 
-    // Execute the transaction through Q402 facilitator
-    // This handles:
-    // - Signature verification
-    // - Gas sponsorship
-    // - On-chain execution
-    const result = await q402Service.executeTransaction(
-      body.actionLogId,
-      body.signature,
-      body.signerAddress
-    );
+    // Check if this is a batch execution
+    if (body.isBatch) {
+      // Execute batch through Q402 BatchExecutor
+      const client = createQ402Client(network);
+      const batchResult = await client.executeBatchRequest(
+        body.actionLogId,
+        body.signature,
+        body.signerAddress
+      );
+      
+      result = {
+        success: batchResult.success,
+        txHash: batchResult.txHash,
+        blockNumber: batchResult.blockNumber,
+        gasUsed: batchResult.gasUsed,
+        error: batchResult.error,
+        q402RequestId: body.actionLogId,
+      };
+
+      logger.q402('Batch executed', {
+        requestId: body.actionLogId,
+        txHash: batchResult.txHash,
+        success: batchResult.success,
+        operationCount: batchResult.operationResults?.length,
+      });
+    } else {
+      // Create Q402 service for single transaction
+      const q402Service = createQ402Service(network);
+
+      // Execute the transaction through Q402 facilitator
+      // This handles:
+      // - Signature verification
+      // - Gas sponsorship
+      // - On-chain execution
+      result = await q402Service.executeTransaction(
+        body.actionLogId,
+        body.signature,
+        body.signerAddress
+      );
+    }
 
     // Create action log entry for response (not persisted here - client handles logging)
     const actionLog: ActionLog = {

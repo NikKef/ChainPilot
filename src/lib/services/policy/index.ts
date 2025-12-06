@@ -6,7 +6,15 @@ import type {
   PreparedTx,
   TransactionType,
 } from '@/lib/types';
-import { evaluatePolicy, assessRisk, isAddressAllowed } from './evaluator';
+import { 
+  evaluatePolicy, 
+  assessRisk, 
+  isAddressAllowed,
+  evaluateBatchPolicy,
+  type BatchOperationContext,
+  type BatchPolicyEvaluationContext,
+  type BatchPolicyEvaluationResult,
+} from './evaluator';
 import {
   validatePolicy,
   validateListAddress,
@@ -24,6 +32,7 @@ export {
   evaluatePolicy,
   assessRisk,
   isAddressAllowed,
+  evaluateBatchPolicy,
   validatePolicy,
   validateListAddress,
   normalizePolicy,
@@ -32,6 +41,12 @@ export {
   shouldBlockAddress,
   formatPolicyForDisplay,
   validateTransactionValue,
+};
+
+export type {
+  BatchOperationContext,
+  BatchPolicyEvaluationContext,
+  BatchPolicyEvaluationResult,
 };
 
 /**
@@ -79,6 +94,36 @@ export class PolicyEngine {
     };
 
     return evaluatePolicy(context);
+  }
+
+  /**
+   * Evaluate a batch of operations against the policy
+   */
+  async evaluateBatch(
+    operations: Array<{
+      type: 'transfer' | 'swap' | 'call';
+      targetAddress?: string;
+      tokenAddress?: string;
+      valueUsd?: number;
+      slippageBps?: number;
+    }>,
+    todaySpendUsd: number,
+    walletAddress: string
+  ): Promise<BatchPolicyEvaluationResult> {
+    const batchContext: BatchPolicyEvaluationContext = {
+      policy: this.policy,
+      operations: operations.map(op => ({
+        type: op.type,
+        targetAddress: op.targetAddress,
+        tokenAddress: op.tokenAddress,
+        valueUsd: op.valueUsd,
+        slippageBps: op.slippageBps,
+      })),
+      todaySpendUsd,
+      userAddress: walletAddress,
+    };
+
+    return evaluateBatchPolicy(batchContext);
   }
 
   /**

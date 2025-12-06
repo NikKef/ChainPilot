@@ -32,6 +32,9 @@ import { logger } from '@/lib/utils';
 export * from './types';
 export { SignatureVerifier, createSignatureVerifier } from './verifier';
 export { TransactionSettler, createTransactionSettler } from './settler';
+export { BatchSignatureVerifier, createBatchSignatureVerifier } from './batch-verifier';
+export { BatchTransactionSettler, createBatchTransactionSettler } from './batch-settler';
+export type { BatchSettleRequest, BatchSettleResponse, BatchExecutorConfig } from './batch-settler';
 
 /**
  * Q402 Facilitator Service

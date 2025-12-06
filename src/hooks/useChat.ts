@@ -95,6 +95,19 @@ export function useChat({
   const [pendingSwapId, setPendingSwapId] = useState<string | undefined>(undefined);
   const [isDirectTransaction, setIsDirectTransaction] = useState<boolean>(false);
   const [isSwapApproval, setIsSwapApproval] = useState<boolean>(false);
+  const [isBatchSwap, setIsBatchSwap] = useState<boolean>(false);
+  const [batchSwapDetails, setBatchSwapDetails] = useState<{
+    tokenIn: string | null;
+    tokenInSymbol: string;
+    tokenOut: string | null;
+    tokenOutSymbol: string;
+    amountIn: string;
+    minAmountOut: string;
+    estimatedAmountOut: string;
+    slippageBps: number;
+    swapData: string;
+    swapRecipient?: string; // Optional: send swap output to different address
+  } | null>(null);
   
   const abortControllerRef = useRef<AbortController | null>(null);
   const loadedConversationRef = useRef<string | null>(null);
@@ -229,10 +242,23 @@ export function useChat({
           setPendingSwapId(data.swapApprovalRequired.pendingSwapId);
           setIsDirectTransaction(data.swapApprovalRequired.isDirectTransaction || false);
           setIsSwapApproval(true);
+          setIsBatchSwap(data.swapApprovalRequired.useBatchExecutor || false);
           setPendingTransferId(undefined);
+        } 
+        // Check for batch swap (gas-sponsored via BatchExecutor)
+        else if (data.isBatchSwap && data.batchSwapDetails) {
+          console.log('[Chat] Batch swap detected:', data.batchSwapDetails);
+          setIsBatchSwap(true);
+          setBatchSwapDetails(data.batchSwapDetails);
+          setIsDirectTransaction(false);
+          setIsSwapApproval(false);
+          setPendingTransferId(undefined);
+          setPendingSwapId(undefined);
         } else {
           setPendingTransferId(undefined);
           setPendingSwapId(undefined);
+          setIsBatchSwap(false);
+          setBatchSwapDetails(null);
           setIsDirectTransaction(false);
           setIsSwapApproval(false);
         }
@@ -652,9 +678,108 @@ export function useChat({
         }
       }
 
+      // Check if this is a batch swap (gas-sponsored via BatchExecutor)
+      if (isBatchSwap && batchSwapDetails && pendingTransaction.type === 'swap') {
+        console.log('[Chat] Batch swap detected - using gas-sponsored BatchExecutor');
+        
+        setMessages(prev => [...prev, {
+          id: `msg_${Date.now()}_signing`,
+          sessionId,
+          role: 'assistant',
+          content: '🔐 Please **sign** the batch swap in your wallet...\n\n✨ Gas will be sponsored - you only need to sign!',
+          createdAt: new Date().toISOString(),
+        }]);
+        
+        // Prepare batch request
+        const batchResponse = await fetch('/api/transactions/prepare/batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId,
+            network: pendingTransaction.network,
+            signerAddress,
+            operations: [{
+              type: 'swap',
+              tokenIn: batchSwapDetails.tokenIn,
+              tokenInSymbol: batchSwapDetails.tokenInSymbol,
+              tokenOut: batchSwapDetails.tokenOut,
+              tokenOutSymbol: batchSwapDetails.tokenOutSymbol,
+              amount: batchSwapDetails.amountIn,
+              slippageBps: batchSwapDetails.slippageBps,
+              swapRecipient: batchSwapDetails.swapRecipient,
+            }],
+          }),
+        });
+        
+        const batchData = await batchResponse.json();
+        
+        if (!batchData.success) {
+          throw new Error(batchData.error || 'Failed to prepare batch swap');
+        }
+        
+        // Sign the batch
+        const signer = await provider.getSigner();
+        const signature = await signer.signTypedData(
+          batchData.typedData.domain,
+          { BatchWitness: batchData.typedData.types.BatchWitness },
+          batchData.typedData.message
+        );
+        
+        // Execute via batch endpoint
+        const executeResponse = await fetch('/api/transactions/execute', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId,
+            actionLogId: batchData.requestId,
+            signature,
+            signerAddress,
+            network: pendingTransaction.network,
+            isBatch: true,
+          }),
+        });
+        
+        const executeResult = await executeResponse.json();
+        
+        if (executeResult.success && executeResult.result.txHash) {
+          await logTransactionSuccess({
+            sessionId,
+            intentType,
+            network: pendingTransaction.network,
+            userMessage: lastUserMessage,
+            preview: pendingTransaction,
+            policyDecision,
+            txHash: executeResult.result.txHash,
+            estimatedValueUsd: pendingTransaction.valueUsd ? parseFloat(pendingTransaction.valueUsd) : undefined,
+          });
+          
+          setMessages(prev => {
+            const filtered = prev.filter(m => !m.content.includes('sign') && !m.content.includes('confirm'));
+            return [...filtered, {
+              id: `msg_${Date.now()}_tx`,
+              sessionId,
+              role: 'assistant',
+              content: `✅ **Swap executed successfully!** (Gas-free via BatchExecutor)\n\n🔗 [View on Explorer](https://${pendingTransaction.network === 'mainnet' ? 'bscscan.com' : 'testnet.bscscan.com'}/tx/${executeResult.result.txHash})`,
+              createdAt: new Date().toISOString(),
+            }];
+          });
+          
+          onTransactionSuccess?.(executeResult.result.txHash);
+        } else {
+          throw new Error(executeResult.error || 'Batch swap execution failed');
+        }
+        
+        setPendingTransaction(null);
+        setPolicyDecision(null);
+        setIsBatchSwap(false);
+        setBatchSwapDetails(null);
+        setIsLoading(false);
+        return;
+      }
+
       // Check if this is a swap that needs direct execution (not via Q402)
       // Swaps cannot use Q402 because DEX routers pull tokens from msg.sender
-      const isSwapTransaction = pendingTransaction.type === 'swap';
+      const isSwapTransaction = pendingTransaction.type === 'swap' && !isBatchSwap;
       if (isSwapTransaction || isDirectTransaction) {
         console.log('[Chat] Swap/Direct transaction detected - executing directly from user wallet');
         
@@ -886,7 +1011,7 @@ export function useChat({
     } finally {
       setIsLoading(false);
     }
-  }, [pendingTransaction, policyDecision, sessionId, provider, signerAddress, lastUserMessage, pendingTransferId, pendingSwapId, isSwapApproval, isDirectTransaction, onError, onTransactionSuccess, prepareAndSign, resetQ402]);
+  }, [pendingTransaction, policyDecision, sessionId, provider, signerAddress, lastUserMessage, pendingTransferId, pendingSwapId, isSwapApproval, isDirectTransaction, isBatchSwap, batchSwapDetails, onError, onTransactionSuccess, prepareAndSign, resetQ402]);
 
   const rejectTransaction = useCallback(async () => {
     // Log cancelled transaction to activity
@@ -906,6 +1031,8 @@ export function useChat({
     setPendingSwapId(undefined);
     setIsDirectTransaction(false);
     setIsSwapApproval(false);
+    setIsBatchSwap(false);
+    setBatchSwapDetails(null);
 
     setMessages(prev => [...prev, {
       id: `msg_${Date.now()}_reject`,

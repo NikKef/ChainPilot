@@ -21,14 +21,16 @@ import {
   type Intent,
   type TransferIntent,
   type SwapIntent,
+  type BatchIntent,
+  type BatchOperation,
   type TransactionPreview,
   type ChatMessage,
 } from '@/lib/types';
 import { formatErrorResponse, getErrorStatusCode, ValidationError } from '@/lib/utils/errors';
 import { validateChatMessage, isValidNetwork } from '@/lib/utils/validation';
 import { logger } from '@/lib/utils';
-import { type NetworkType, Q402_FACILITATOR } from '@/lib/utils/constants';
-import { storePendingTransfer, storePendingSwap } from '@/lib/services/q402';
+import { type NetworkType, Q402_FACILITATOR, Q402_CONTRACTS } from '@/lib/utils/constants';
+import { storePendingTransfer, storePendingSwap, createQ402Client } from '@/lib/services/q402';
 import { formatUnits } from 'ethers';
 
 function intentNeedsFollowUp(intent: Intent): boolean {
@@ -852,10 +854,12 @@ async function buildResponse(
         }
       }
 
-      // No approval needed (native BNB input or already approved)
+      // No approval needed for PancakeSwap router (native BNB input or already approved)
+      // Check if BatchExecutor is deployed for gas-sponsored swaps
+      const batchExecutorAddress = Q402_CONTRACTS[network].batchExecutor;
+      const useBatchExecutor = !!batchExecutorAddress && batchExecutorAddress.length > 2;
+
       // Build the swap transaction
-      // NOTE: Swaps must be executed directly by the user (not via facilitator)
-      // because DEX routers pull tokens from msg.sender, which would be the facilitator
       const swapResult = await buildSwap(
         walletAddress,
         swapIntent.tokenIn || null,
@@ -871,6 +875,184 @@ async function buildResponse(
         : { decimals: 18, symbol: 'BNB' };
       const formattedOutput = formatUnits(swapResult.quote.amountOut, tokenOutInfo.decimals);
 
+      // If BatchExecutor is available and it's a token swap, check BatchExecutor approval
+      if (useBatchExecutor && !isNativeIn && swapIntent.tokenIn) {
+        const q402Client = createQ402Client(network);
+        const batchApprovalCheck = await q402Client.checkBatchApprovalNeeded(
+          swapIntent.tokenIn,
+          walletAddress,
+          swapResult.quote.amountIn
+        );
+
+        if (batchApprovalCheck.needsApproval) {
+          // Need to approve BatchExecutor first
+          logger.info('BatchExecutor approval needed for gas-sponsored swap', {
+            tokenIn: swapIntent.tokenIn,
+            walletAddress,
+            requiredAmount: batchApprovalCheck.requiredAmount.toString(),
+            currentAllowance: batchApprovalCheck.currentAllowance.toString(),
+            batchExecutorAddress: batchApprovalCheck.batchExecutorAddress,
+          });
+
+          // Build approval for BatchExecutor (one-time, user pays gas)
+          const { buildBatchExecutorApproval } = await import('@/lib/services/web3/transactions');
+          const approvalTx = await buildBatchExecutorApproval(
+            walletAddress,
+            swapIntent.tokenIn,
+            network
+          );
+          
+          const approvalPreview = await createTransactionPreview(
+            'contract_call',
+            approvalTx,
+            {
+              from: walletAddress,
+              network,
+              tokenSymbol: tokenInSymbol,
+              tokenAddress: swapIntent.tokenIn,
+              amount: swapIntent.amount,
+              methodName: 'approve',
+            }
+          );
+          
+          const policy = getDefaultPolicy(sessionId);
+          const policyEngine = createPolicyEngine(policy, network);
+          const approvalPolicyDecision = await policyEngine.evaluate(
+            'contract_call',
+            { targetAddress: swapIntent.tokenIn },
+            0,
+            walletAddress
+          );
+          
+          // Store pending swap for auto-follow-up after approval
+          const pendingSwapId = `pending_batch_swap_${sessionId}_${Date.now()}`;
+          const now = new Date();
+          const expiresAt = new Date(now.getTime() + Q402_FACILITATOR.requestExpiryMs);
+          
+          storePendingSwap({
+            approvalRequestId: pendingSwapId,
+            sessionId,
+            network,
+            walletAddress,
+            tokenIn: swapIntent.tokenIn,
+            tokenInSymbol,
+            tokenOut: swapIntent.tokenOut || null,
+            tokenOutSymbol,
+            amount: swapIntent.amount,
+            slippageBps,
+            createdAt: now.toISOString(),
+            expiresAt: expiresAt.toISOString(),
+          });
+          
+          const pendingSwapIntent = {
+            ...swapIntent,
+            _pendingApproval: true,
+            _pendingSwapId: pendingSwapId,
+            _useBatchExecutor: true,
+          };
+          
+          const content = `Before swapping ${swapIntent.amount} ${tokenInSymbol} for ${tokenOutSymbol}, you need to approve the ChainPilot BatchExecutor (one-time setup).\n\n` +
+            `**One-time approval**: Approve ${tokenInSymbol} spending\n` +
+            `BatchExecutor: ${batchApprovalCheck.batchExecutorAddress.slice(0, 10)}...${batchApprovalCheck.batchExecutorAddress.slice(-8)}\n\n` +
+            `⚠️ **Note**: You pay gas for this one-time approval. After that, all swaps for ${tokenInSymbol} will be **gas-free**!\n\n` +
+            `📊 **Estimated swap**: ~${formattedOutput} ${tokenOutSymbol}`;
+          
+          return {
+            message: {
+              id: generateId(),
+              sessionId,
+              role: 'assistant',
+              content,
+              intent: pendingSwapIntent,
+              createdAt: new Date().toISOString(),
+            },
+            intent: pendingSwapIntent,
+            requiresFollowUp: false,
+            transactionPreview: approvalPreview,
+            policyDecision: approvalPolicyDecision,
+            swapApprovalRequired: {
+              tokenInAddress: swapIntent.tokenIn,
+              tokenInSymbol,
+              tokenOutAddress: swapIntent.tokenOut || null,
+              tokenOutSymbol,
+              routerAddress: batchApprovalCheck.batchExecutorAddress, // Using BatchExecutor address
+              amount: swapIntent.amount,
+              currentAllowance: batchApprovalCheck.currentAllowance.toString(),
+              requiredAmount: batchApprovalCheck.requiredAmount.toString(),
+              pendingSwapId,
+              isDirectTransaction: true, // User pays gas for approval
+              slippageBps,
+              estimatedOutput: formattedOutput,
+              useBatchExecutor: true,
+            },
+          };
+        }
+
+        // BatchExecutor is approved - prepare gas-sponsored batch swap
+        logger.info('Preparing gas-sponsored batch swap', {
+          tokenIn: swapIntent.tokenIn,
+          tokenOut: swapIntent.tokenOut,
+          amount: swapIntent.amount,
+        });
+
+        const preview = await createTransactionPreview(
+          'swap',
+          swapResult.preparedTx,
+          {
+            from: walletAddress,
+            network,
+            amount: swapIntent.amount,
+            tokenInSymbol,
+            tokenOutSymbol,
+            tokenOutAmount: formattedOutput,
+            slippageBps,
+          }
+        );
+
+        const policy = getDefaultPolicy(sessionId);
+        const policyEngine = createPolicyEngine(policy, network);
+        const policyDecision = await policyEngine.evaluate(
+          'swap',
+          { slippageBps },
+          0,
+          walletAddress
+        );
+
+        // Gas-sponsored swap via BatchExecutor!
+        const content = `Ready to swap ${swapIntent.amount} ${tokenInSymbol} for approximately ${formattedOutput} ${tokenOutSymbol}.\n\n` +
+          `✨ **Gas-free!** The swap will be executed via ChainPilot BatchExecutor.\n\n` +
+          `📊 **Slippage tolerance**: ${slippageBps / 100}%`;
+
+        return {
+          message: {
+            id: generateId(),
+            sessionId,
+            role: 'assistant',
+            content,
+            intent,
+            createdAt: new Date().toISOString(),
+          },
+          intent,
+          requiresFollowUp: false,
+          transactionPreview: preview,
+          policyDecision,
+          // Use batch execution - NOT direct transaction
+          isBatchSwap: true,
+          batchSwapDetails: {
+            tokenIn: swapIntent.tokenIn || null,
+            tokenInSymbol,
+            tokenOut: swapIntent.tokenOut || null,
+            tokenOutSymbol,
+            amountIn: swapIntent.amount,
+            minAmountOut: swapResult.quote.amountOutMin,
+            estimatedAmountOut: formattedOutput,
+            slippageBps,
+            swapData: swapResult.preparedTx.data,
+          },
+        };
+      }
+
+      // Fallback: No BatchExecutor or native BNB swap - use direct execution
       const preview = await createTransactionPreview(
         'swap',
         swapResult.preparedTx,
@@ -894,7 +1076,7 @@ async function buildResponse(
         walletAddress
       );
 
-      // Note: Swaps require direct execution because DEX routers pull tokens from msg.sender
+      // Note: Native BNB swaps still require direct execution
       const content = `Ready to swap ${swapIntent.amount} ${tokenInSymbol} for approximately ${formattedOutput} ${tokenOutSymbol}.\n\n` +
         `⚠️ **Note**: You will need to pay gas for this swap transaction.\n\n` +
         `📊 **Slippage tolerance**: ${slippageBps / 100}%`;
@@ -914,6 +1096,305 @@ async function buildResponse(
         policyDecision,
         // Flag to indicate this must be executed directly, not via facilitator
         isDirectTransaction: true,
+      };
+    }
+
+    case 'batch': {
+      const batchIntent = intent as BatchIntent;
+      
+      if (!batchIntent.operations || batchIntent.operations.length === 0) {
+        return {
+          message: {
+            id: generateId(),
+            sessionId,
+            role: 'assistant',
+            content: 'I detected a batch request but couldn\'t parse the operations. Please try again with clearer instructions.',
+            intent,
+            createdAt: new Date().toISOString(),
+          },
+          intent,
+          requiresFollowUp: true,
+        };
+      }
+
+      // Process batch operations
+      // If a transfer follows a swap and uses previous output, merge them
+      const processedOperations: BatchOperation[] = [];
+      
+      for (let i = 0; i < batchIntent.operations.length; i++) {
+        const op = batchIntent.operations[i];
+        const prevOp = i > 0 ? processedOperations[processedOperations.length - 1] : undefined;
+        
+        // Check if this transfer uses the previous swap's output
+        if (op.type === 'transfer' && op._usesPreviousOutput && prevOp?.type === 'swap') {
+          // Merge: set the swap's output recipient to the transfer's recipient
+          prevOp.swapRecipient = op.recipient;
+          // Inherit token info from swap output
+          op.tokenSymbol = prevOp.tokenOutSymbol;
+          op.tokenAddress = prevOp.tokenOut;
+          // Don't add the transfer as a separate operation - swap now sends to recipient
+          logger.info('Merged transfer into swap', {
+            swapRecipient: op.recipient,
+            tokenOut: prevOp.tokenOutSymbol,
+          });
+          continue;
+        }
+        
+        processedOperations.push(op);
+      }
+
+      // If we only have one operation after merging, handle it as a single intent
+      if (processedOperations.length === 1) {
+        const singleOp = processedOperations[0];
+        
+        if (singleOp.type === 'swap') {
+          // Handle as a swap with custom recipient
+          const swapIntent: SwapIntent = {
+            type: 'swap',
+            network,
+            tokenIn: singleOp.tokenIn || undefined,
+            tokenInSymbol: singleOp.tokenInSymbol,
+            tokenOut: singleOp.tokenOut || undefined,
+            tokenOutSymbol: singleOp.tokenOutSymbol,
+            amount: singleOp.amount,
+            slippageBps: singleOp.slippageBps || 300,
+          };
+          
+          // Build swap with custom recipient if specified
+          const slippageBps = singleOp.slippageBps || 300;
+          
+          // Check if this is a native BNB output swap
+          // IMPORTANT: Only treat as native if explicitly BNB symbol, not just missing tokenOut address
+          const tokenOutUpperCase = singleOp.tokenOutSymbol?.toUpperCase();
+          const isExplicitlyNativeBNB = tokenOutUpperCase === 'BNB' || tokenOutUpperCase === 'TBNB';
+          const isNativeOut = isExplicitlyNativeBNB;
+          const hasCustomRecipient = !!singleOp.swapRecipient;
+          
+          // If tokenOut is missing but symbol is NOT BNB (e.g., "ETH"), we need to ask for the address
+          if (!singleOp.tokenOut && !isExplicitlyNativeBNB && singleOp.tokenOutSymbol) {
+            const content = `${singleOp.tokenOutSymbol} is available on mainnet but not on testnet. If you have a testnet version of this token, please provide its contract address.\n\n` +
+              `**Intent**: swap ${singleOp.tokenIn || ''} for ${singleOp.tokenOutSymbol}`;
+            
+            return {
+              message: {
+                id: generateId(),
+                sessionId,
+                role: 'assistant',
+                content,
+                intent: { type: 'swap' },
+                createdAt: new Date().toISOString(),
+              },
+              intent: { type: 'swap' },
+              requiresFollowUp: true,
+              partialIntent: {
+                type: 'swap',
+                tokenIn: singleOp.tokenIn,
+                tokenInSymbol: singleOp.tokenInSymbol,
+                tokenOutSymbol: singleOp.tokenOutSymbol,
+                amount: singleOp.amount,
+                unresolvedSymbol: singleOp.tokenOutSymbol,
+              },
+            };
+          }
+          
+          // LIMITATION: Native BNB output swaps with custom recipient cannot use BatchExecutor
+          // because the contract tracks owner's balance, not recipient's
+          // In this case, we do a two-step approach: swap to user, then they transfer
+          const canUseCustomRecipientInSwap = !isNativeOut;
+          const effectiveRecipient = canUseCustomRecipientInSwap ? singleOp.swapRecipient : undefined;
+          
+          const swapResult = await buildSwap(
+            walletAddress,
+            singleOp.tokenIn || null,
+            singleOp.tokenOut || null,
+            singleOp.amount || '0',
+            network,
+            slippageBps,
+            effectiveRecipient // Only pass recipient for token output swaps
+          );
+
+          const tokenOutInfo = singleOp.tokenOut 
+            ? await getTokenInfo(singleOp.tokenOut, network)
+            : { decimals: 18, symbol: 'BNB' };
+          const formattedOutput = formatUnits(swapResult.quote.amountOut, tokenOutInfo.decimals);
+
+          const preview = await createTransactionPreview(
+            'swap',
+            swapResult.preparedTx,
+            {
+              from: walletAddress,
+              network,
+              amount: singleOp.amount,
+              tokenInSymbol: singleOp.tokenInSymbol,
+              tokenOutSymbol: singleOp.tokenOutSymbol,
+              tokenOutAmount: formattedOutput,
+              slippageBps,
+            }
+          );
+
+          const policy = getDefaultPolicy(sessionId);
+          const policyEngine = createPolicyEngine(policy, network);
+          const policyDecision = await policyEngine.evaluate(
+            'swap',
+            { slippageBps },
+            0,
+            walletAddress
+          );
+
+          // Check BatchExecutor availability for gas-sponsored execution
+          const batchExecutorAddress = Q402_CONTRACTS[network].batchExecutor;
+          const useBatchExecutor = !!batchExecutorAddress && batchExecutorAddress.length > 2;
+          const isNativeIn = !singleOp.tokenIn || singleOp.tokenInSymbol?.toUpperCase() === 'BNB';
+
+          // If native BNB output with custom recipient, we need to inform the user
+          // they'll receive BNB first and then need to transfer it
+          if (isNativeOut && hasCustomRecipient) {
+            const content = `I'll help you swap ${singleOp.amount} ${singleOp.tokenInSymbol} for approximately ${formattedOutput} ${singleOp.tokenOutSymbol}.\n\n` +
+              `⚠️ **Note**: Since you're swapping to native BNB with a custom recipient, this requires **two steps**:\n` +
+              `1. First, I'll swap your ${singleOp.tokenInSymbol} to BNB (you'll receive it)\n` +
+              `2. Then, you can send the BNB to ${singleOp.swapRecipient?.slice(0, 10)}...${singleOp.swapRecipient?.slice(-8)}\n\n` +
+              `📊 **Slippage tolerance**: ${slippageBps / 100}%\n\n` +
+              `Ready to proceed with step 1 (the swap)?`;
+
+            // For now, just do the swap to user
+            if (useBatchExecutor && !isNativeIn && singleOp.tokenIn) {
+              return {
+                message: {
+                  id: generateId(),
+                  sessionId,
+                  role: 'assistant',
+                  content,
+                  intent: swapIntent,
+                  createdAt: new Date().toISOString(),
+                },
+                intent: swapIntent,
+                requiresFollowUp: false,
+                transactionPreview: preview,
+                policyDecision,
+                isBatchSwap: true,
+                batchSwapDetails: {
+                  tokenIn: singleOp.tokenIn || null,
+                  tokenInSymbol: singleOp.tokenInSymbol || 'Token',
+                  tokenOut: singleOp.tokenOut || null,
+                  tokenOutSymbol: singleOp.tokenOutSymbol || 'Token',
+                  amountIn: singleOp.amount || '0',
+                  minAmountOut: swapResult.quote.amountOutMin,
+                  estimatedAmountOut: formattedOutput,
+                  slippageBps,
+                  swapData: swapResult.preparedTx.data,
+                  // No swapRecipient - output goes to user first
+                },
+              };
+            }
+            
+            // Direct execution fallback
+            return {
+              message: {
+                id: generateId(),
+                sessionId,
+                role: 'assistant',
+                content,
+                intent: swapIntent,
+                createdAt: new Date().toISOString(),
+              },
+              intent: swapIntent,
+              requiresFollowUp: false,
+              transactionPreview: preview,
+              policyDecision,
+              isDirectTransaction: true,
+            };
+          }
+
+          const recipientDisplay = effectiveRecipient 
+            ? `\n\n📤 **Output sent to:** ${effectiveRecipient.slice(0, 10)}...${effectiveRecipient.slice(-8)}`
+            : '';
+
+          if (useBatchExecutor && !isNativeIn && singleOp.tokenIn) {
+            // Gas-sponsored swap
+            const content = `Ready to swap ${singleOp.amount} ${singleOp.tokenInSymbol} for approximately ${formattedOutput} ${singleOp.tokenOutSymbol}.${recipientDisplay}\n\n` +
+              `✨ **Gas-free!** The swap will be executed via ChainPilot BatchExecutor.\n\n` +
+              `📊 **Slippage tolerance**: ${slippageBps / 100}%`;
+
+            return {
+              message: {
+                id: generateId(),
+                sessionId,
+                role: 'assistant',
+                content,
+                intent: swapIntent,
+                createdAt: new Date().toISOString(),
+              },
+              intent: swapIntent,
+              requiresFollowUp: false,
+              transactionPreview: preview,
+              policyDecision,
+              isBatchSwap: true,
+              batchSwapDetails: {
+                tokenIn: singleOp.tokenIn || null,
+                tokenInSymbol: singleOp.tokenInSymbol || 'Token',
+                tokenOut: singleOp.tokenOut || null,
+                tokenOutSymbol: singleOp.tokenOutSymbol || 'Token',
+                amountIn: singleOp.amount || '0',
+                minAmountOut: swapResult.quote.amountOutMin,
+                estimatedAmountOut: formattedOutput,
+                slippageBps,
+                swapData: swapResult.preparedTx.data,
+                swapRecipient: effectiveRecipient,
+              },
+            };
+          }
+
+          // Fallback: direct execution
+          const content = `Ready to swap ${singleOp.amount} ${singleOp.tokenInSymbol} for approximately ${formattedOutput} ${singleOp.tokenOutSymbol}.${recipientDisplay}\n\n` +
+            `⚠️ **Note**: You will need to pay gas for this swap transaction.\n\n` +
+            `📊 **Slippage tolerance**: ${slippageBps / 100}%`;
+
+          return {
+            message: {
+              id: generateId(),
+              sessionId,
+              role: 'assistant',
+              content,
+              intent: swapIntent,
+              createdAt: new Date().toISOString(),
+            },
+            intent: swapIntent,
+            requiresFollowUp: false,
+            transactionPreview: preview,
+            policyDecision,
+            isDirectTransaction: true,
+          };
+        }
+      }
+
+      // Handle multiple operations (true batch)
+      // For now, return a message explaining multi-operation batches
+      const opDescriptions = processedOperations.map((op, i) => {
+        if (op.type === 'swap') {
+          return `${i + 1}. Swap ${op.amount} ${op.tokenInSymbol} → ${op.tokenOutSymbol}`;
+        } else if (op.type === 'transfer') {
+          return `${i + 1}. Transfer ${op.amount || 'output'} ${op.tokenSymbol} to ${op.recipient?.slice(0, 10)}...`;
+        }
+        return `${i + 1}. ${op.type} operation`;
+      }).join('\n');
+
+      const content = `I detected a batch of ${processedOperations.length} operations:\n\n${opDescriptions}\n\n` +
+        `✨ These operations can be executed in a single transaction via ChainPilot BatchExecutor.\n\n` +
+        `Would you like to proceed?`;
+
+      return {
+        message: {
+          id: generateId(),
+          sessionId,
+          role: 'assistant',
+          content,
+          intent,
+          createdAt: new Date().toISOString(),
+        },
+        intent,
+        requiresFollowUp: false,
+        // Store the processed operations for later execution
+        batchOperations: processedOperations,
       };
     }
 

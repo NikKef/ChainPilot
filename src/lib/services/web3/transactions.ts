@@ -484,6 +484,48 @@ export async function buildSwapApproval(
 }
 
 /**
+ * Build a token approval transaction for the BatchExecutor contract
+ * This is a one-time approval that enables gas-sponsored swaps
+ */
+export async function buildBatchExecutorApproval(
+  from: string,
+  tokenAddress: string,
+  network: NetworkType
+): Promise<PreparedTx> {
+  logger.web3Tx('buildBatchExecutorApproval', { from, tokenAddress, network });
+
+  const { Q402_CONTRACTS } = await import('@/lib/utils/constants');
+  const batchExecutorAddress = Q402_CONTRACTS[network].batchExecutor;
+  
+  if (!batchExecutorAddress) {
+    throw new Web3Error('BatchExecutor contract not deployed on this network');
+  }
+  
+  // Use max uint256 for unlimited approval (enables gas-free swaps forever)
+  const maxApproval = BigInt('115792089237316195423570985008687907853269984665640564039457584007913129639935');
+  
+  // Encode approve call
+  const iface = new Interface(ERC20_ABI);
+  const data = iface.encodeFunctionData('approve', [batchExecutorAddress, maxApproval]);
+
+  // Estimate gas
+  const gasEstimate = await estimateGas(
+    { from, to: tokenAddress, data },
+    network
+  );
+
+  const feeData = await getFeeData(network);
+
+  return {
+    to: tokenAddress,
+    data,
+    value: '0',
+    gasLimit: (gasEstimate * BigInt(120) / BigInt(100)).toString(),
+    gasPrice: feeData.gasPrice.toString(),
+  };
+}
+
+/**
  * Create a transaction preview for UI display
  */
 export async function createTransactionPreview(

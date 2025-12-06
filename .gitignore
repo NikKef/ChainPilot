@@ -11,9 +11,7 @@ artifacts/
 
 .next/
 
-supabase/
-
-public/
+supabase/migrations/
 
 tsconfig.tsbuildinfo
 

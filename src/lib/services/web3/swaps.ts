@@ -132,20 +132,22 @@ export async function buildSwapExactTokensForTokens(
   tokenOut: string,
   amountIn: string,
   network: NetworkType,
-  slippageBps: number = 300
+  slippageBps: number = 300,
+  recipient?: string // Optional recipient (defaults to from)
 ): Promise<PreparedTx> {
-  logger.web3Tx('buildSwapExactTokensForTokens', { from, tokenIn, tokenOut, amountIn, network });
+  logger.web3Tx('buildSwapExactTokensForTokens', { from, tokenIn, tokenOut, amountIn, network, recipient });
 
   const quote = await getSwapQuote(tokenIn, tokenOut, amountIn, network, slippageBps);
   const router = getRouterContract(network);
   const routerAddress = PANCAKE_ROUTER[network];
+  const outputRecipient = recipient || from;
 
   const iface = new Interface(PANCAKE_ROUTER_ABI);
   const data = iface.encodeFunctionData('swapExactTokensForTokens', [
     quote.amountIn,
     quote.amountOutMin,
     quote.path,
-    from,
+    outputRecipient, // Send output to recipient
     quote.deadline,
   ]);
 
@@ -174,18 +176,20 @@ export async function buildSwapExactETHForTokens(
   tokenOut: string,
   amountIn: string,
   network: NetworkType,
-  slippageBps: number = 300
+  slippageBps: number = 300,
+  recipient?: string // Optional recipient (defaults to from)
 ): Promise<PreparedTx> {
-  logger.web3Tx('buildSwapExactETHForTokens', { from, tokenOut, amountIn, network });
+  logger.web3Tx('buildSwapExactETHForTokens', { from, tokenOut, amountIn, network, recipient });
 
   const quote = await getSwapQuote('native', tokenOut, amountIn, network, slippageBps);
   const routerAddress = PANCAKE_ROUTER[network];
+  const outputRecipient = recipient || from;
 
   const iface = new Interface(PANCAKE_ROUTER_ABI);
   const data = iface.encodeFunctionData('swapExactETHForTokens', [
     quote.amountOutMin,
     quote.path,
-    from,
+    outputRecipient, // Send output to recipient
     quote.deadline,
   ]);
 
@@ -214,19 +218,21 @@ export async function buildSwapExactTokensForETH(
   tokenIn: string,
   amountIn: string,
   network: NetworkType,
-  slippageBps: number = 300
+  slippageBps: number = 300,
+  recipient?: string // Optional recipient (defaults to from)
 ): Promise<PreparedTx> {
-  logger.web3Tx('buildSwapExactTokensForETH', { from, tokenIn, amountIn, network });
+  logger.web3Tx('buildSwapExactTokensForETH', { from, tokenIn, amountIn, network, recipient });
 
   const quote = await getSwapQuote(tokenIn, 'native', amountIn, network, slippageBps);
   const routerAddress = PANCAKE_ROUTER[network];
+  const outputRecipient = recipient || from;
 
   const iface = new Interface(PANCAKE_ROUTER_ABI);
   const data = iface.encodeFunctionData('swapExactTokensForETH', [
     quote.amountIn,
     quote.amountOutMin,
     quote.path,
-    from,
+    outputRecipient, // Send output to recipient
     quote.deadline,
   ]);
 
@@ -256,7 +262,8 @@ export async function buildSwap(
   tokenOut: string | null, // null = native BNB
   amountIn: string,
   network: NetworkType,
-  slippageBps: number = 300
+  slippageBps: number = 300,
+  recipient?: string // Optional: recipient for swap output (defaults to from)
 ): Promise<{
   preparedTx: PreparedTx;
   quote: SwapQuote;
@@ -267,6 +274,7 @@ export async function buildSwap(
   const isNativeOut = !tokenOut || tokenOut === 'native';
   const WBNB = getWBNBAddress(network);
   const routerAddress = PANCAKE_ROUTER[network];
+  const outputRecipient = recipient || from;
 
   let quote: SwapQuote;
   let preparedTx: PreparedTx;
@@ -277,14 +285,18 @@ export async function buildSwap(
     throw new Web3Error('Cannot swap BNB to BNB');
   }
 
+  if (recipient) {
+    logger.web3Tx('buildSwap with custom recipient', { from, recipient, tokenIn, tokenOut, amountIn });
+  }
+
   if (isNativeIn) {
     // BNB -> Token
     quote = await getSwapQuote('native', tokenOut!, amountIn, network, slippageBps);
-    preparedTx = await buildSwapExactETHForTokens(from, tokenOut!, amountIn, network, slippageBps);
+    preparedTx = await buildSwapExactETHForTokens(from, tokenOut!, amountIn, network, slippageBps, outputRecipient);
   } else if (isNativeOut) {
     // Token -> BNB
     quote = await getSwapQuote(tokenIn!, 'native', amountIn, network, slippageBps);
-    preparedTx = await buildSwapExactTokensForETH(from, tokenIn!, amountIn, network, slippageBps);
+    preparedTx = await buildSwapExactTokensForETH(from, tokenIn!, amountIn, network, slippageBps, outputRecipient);
 
     // Check approval
     const allowance = await getAllowance(tokenIn!, from, routerAddress, network);
@@ -297,7 +309,7 @@ export async function buildSwap(
   } else {
     // Token -> Token
     quote = await getSwapQuote(tokenIn!, tokenOut!, amountIn, network, slippageBps);
-    preparedTx = await buildSwapExactTokensForTokens(from, tokenIn!, tokenOut!, amountIn, network, slippageBps);
+    preparedTx = await buildSwapExactTokensForTokens(from, tokenIn!, tokenOut!, amountIn, network, slippageBps, outputRecipient);
 
     // Check approval
     const allowance = await getAllowance(tokenIn!, from, routerAddress, network);

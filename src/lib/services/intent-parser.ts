@@ -6,6 +6,8 @@ import type {
   SwapIntent,
   ContractCallIntent,
   ChatMessage,
+  BatchIntent,
+  BatchOperation,
 } from '@/lib/types';
 import { extractContext } from './chaingpt';
 import { isValidAddress, isValidAmount } from '@/lib/utils/validation';
@@ -30,6 +32,14 @@ export class IntentParser {
     logger.debug('Parsing message', { messageLength: message.length });
 
     try {
+      // Check for batch intent patterns first
+      const batchResult = this.detectBatchIntent(message);
+      if (batchResult && batchResult.intent.type === 'batch') {
+        const batchIntent = batchResult.intent as BatchIntent;
+        logger.debug('Detected batch intent', { operationCount: batchIntent.operations.length });
+        return batchResult;
+      }
+
       // Use ChainGPT for context extraction
       const result = await extractContext(message, this.sessionContext);
 
@@ -55,6 +65,177 @@ export class IntentParser {
         confidence: 0.3,
       };
     }
+  }
+
+  /**
+   * Detect batch intent patterns in a message
+   * Looks for phrases like "and then", "after that", "also", etc.
+   */
+  private detectBatchIntent(message: string): ContextExtractionResult | null {
+    const lowerMessage = message.toLowerCase();
+    
+    // Connectors that indicate multiple operations
+    const batchConnectors = [
+      ' and then ',
+      ' then ',
+      ' after that ',
+      ' also ',
+      ' and also ',
+      ', then ',
+      '; ',
+      ' followed by ',
+      ' afterwards ',
+    ];
+    
+    // Check if message contains any batch connector
+    const hasBatchConnector = batchConnectors.some(c => lowerMessage.includes(c));
+    
+    if (!hasBatchConnector) {
+      return null;
+    }
+    
+    // Split message by connectors
+    let parts: string[] = [message];
+    for (const connector of batchConnectors) {
+      const newParts: string[] = [];
+      for (const part of parts) {
+        const split = part.toLowerCase().includes(connector.toLowerCase())
+          ? part.split(new RegExp(connector, 'i'))
+          : [part];
+        newParts.push(...split.map(s => s.trim()).filter(s => s.length > 0));
+      }
+      parts = newParts;
+    }
+    
+    // If we have multiple parts, try to parse each as an operation
+    if (parts.length < 2) {
+      return null;
+    }
+    
+    const operations: BatchOperation[] = [];
+    const missingFields: string[] = [];
+    
+    for (const part of parts) {
+      // Pass the previous operation for "send that to" detection
+      const previousOp = operations.length > 0 ? operations[operations.length - 1] : undefined;
+      const op = this.parseOperationFromText(part, previousOp);
+      if (op) {
+        operations.push(op);
+        
+        // Check for missing fields
+        if (op.type === 'transfer') {
+          if (!op.recipient) missingFields.push(`recipient for "${part.substring(0, 30)}..."`);
+          // Don't require amount if it uses previous output
+          const usesPrevious = (op as BatchOperation & { _usesPreviousOutput?: boolean })._usesPreviousOutput;
+          if (!op.amount && !usesPrevious) missingFields.push(`amount for "${part.substring(0, 30)}..."`);
+        } else if (op.type === 'swap') {
+          if (!op.tokenInSymbol && !op.tokenIn) missingFields.push(`token to swap from in "${part.substring(0, 30)}..."`);
+          if (!op.tokenOutSymbol && !op.tokenOut) missingFields.push(`token to receive in "${part.substring(0, 30)}..."`);
+          if (!op.amount) missingFields.push(`amount for swap "${part.substring(0, 30)}..."`);
+        }
+      }
+    }
+    
+    if (operations.length < 2) {
+      return null;
+    }
+    
+    const batchIntent: BatchIntent = {
+      type: 'batch',
+      operations,
+      network: this.sessionContext.network,
+      description: `Batch of ${operations.length} operations`,
+    };
+    
+    return {
+      intent: batchIntent,
+      missingFields,
+      questions: missingFields.length > 0 
+        ? ['Please provide the missing details for the batch operations.']
+        : [],
+      requiresFollowUp: missingFields.length > 0,
+      confidence: missingFields.length === 0 ? 0.85 : 0.6,
+    };
+  }
+
+  /**
+   * Parse a single operation from text
+   * @param text - The text to parse
+   * @param previousOperation - The previous operation (for "send that to" patterns)
+   */
+  private parseOperationFromText(text: string, previousOperation?: BatchOperation): BatchOperation | null {
+    const lowerText = text.toLowerCase().trim();
+    
+    // Detect "send that to" / "send it to" patterns (uses output from previous operation)
+    const sendThatPatterns = [
+      /(?:send|transfer)\s+(?:that|it|the\s+(?:result|output))\s+to\s+(0x[a-fA-F0-9]{40})/i,
+      /(?:send|transfer)\s+(?:that|it|them)\s+to\s+(\S+)/i,
+    ];
+    
+    for (const pattern of sendThatPatterns) {
+      const match = text.match(pattern);
+      if (match) {
+        const recipient = match[1];
+        // This is a transfer that uses the output of the previous operation
+        // Mark it with a special flag
+        return {
+          type: 'transfer',
+          recipient: isValidAddress(recipient) ? recipient : undefined,
+          // Use previous operation's output token and amount
+          tokenSymbol: previousOperation?.tokenOutSymbol,
+          tokenAddress: previousOperation?.tokenOut,
+          amount: undefined, // Will be determined from swap output
+          _usesPreviousOutput: true, // Special flag
+        } as BatchOperation & { _usesPreviousOutput?: boolean };
+      }
+    }
+    
+    // Detect swap operations
+    const swapPatterns = [
+      /swap\s+(\d+(?:\.\d+)?)\s*(\w+)\s+(?:for|to)\s+(\w+)/i,
+      /exchange\s+(\d+(?:\.\d+)?)\s*(\w+)\s+(?:for|to)\s+(\w+)/i,
+      /convert\s+(\d+(?:\.\d+)?)\s*(\w+)\s+(?:to|into)\s+(\w+)/i,
+    ];
+    
+    for (const pattern of swapPatterns) {
+      const match = text.match(pattern);
+      if (match) {
+        const tokenInSymbol = match[2].toUpperCase();
+        const tokenOutSymbol = match[3].toUpperCase();
+        return {
+          type: 'swap',
+          amount: match[1],
+          tokenInSymbol,
+          tokenIn: this.resolveTokenSymbol(tokenInSymbol) || undefined,
+          tokenOutSymbol,
+          tokenOut: this.resolveTokenSymbol(tokenOutSymbol) || undefined,
+          slippageBps: 300,
+        };
+      }
+    }
+    
+    // Detect transfer operations
+    const transferPatterns = [
+      /(?:send|transfer)\s+(\d+(?:\.\d+)?)\s*(\w+)\s+to\s+(0x[a-fA-F0-9]{40})/i,
+      /(?:send|transfer)\s+(\d+(?:\.\d+)?)\s*(\w+)\s+to\s+(\S+)/i,
+    ];
+    
+    for (const pattern of transferPatterns) {
+      const match = text.match(pattern);
+      if (match) {
+        const tokenSymbol = match[2].toUpperCase();
+        const recipient = match[3];
+        return {
+          type: 'transfer',
+          amount: match[1],
+          tokenSymbol,
+          tokenAddress: tokenSymbol === 'BNB' ? null : this.resolveTokenSymbol(tokenSymbol) || undefined,
+          recipient: isValidAddress(recipient) ? recipient : undefined,
+        };
+      }
+    }
+    
+    return null;
   }
 
   /**
@@ -555,6 +736,13 @@ export class IntentParser {
       case 'audit_contract': {
         if (!('address' in intent) && !('sourceCode' in intent)) {
           missing.push('address');
+        }
+        break;
+      }
+      case 'batch': {
+        const b = intent as BatchIntent;
+        if (!b.operations || b.operations.length === 0) {
+          missing.push('operations');
         }
         break;
       }

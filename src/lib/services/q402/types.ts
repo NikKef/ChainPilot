@@ -215,6 +215,199 @@ export interface Q402BatchResult {
   totalGasUsed?: string;
 }
 
+// =============================================================================
+// Q402 Batch Executor Types (Gas-sponsored batch operations)
+// =============================================================================
+
+/**
+ * Operation types for batch execution
+ */
+export type BatchOperationType = 'transfer' | 'swap' | 'call';
+
+/**
+ * Numeric operation type codes (matching smart contract)
+ */
+export const BATCH_OP_CODES = {
+  TRANSFER: 0,
+  SWAP: 1,
+  CALL: 2,
+} as const;
+
+/**
+ * A single operation in a batch
+ * Maps to the Operation struct in Q402BatchExecutor.sol
+ */
+export interface BatchOperation {
+  /** Operation type: 'transfer', 'swap', or 'call' */
+  type: BatchOperationType;
+  /** Input token address (use zero address for native BNB) */
+  tokenIn: string;
+  /** Input amount in wei */
+  amountIn: string;
+  /** Output token address (for swaps, zero address for native BNB) */
+  tokenOut: string;
+  /** Minimum output amount (for slippage protection in swaps) */
+  minAmountOut: string;
+  /** Target address (recipient for transfers, router for swaps, contract for calls) */
+  target: string;
+  /** Calldata for swaps and calls (empty '0x' for transfers) */
+  data: string;
+  
+  // Additional metadata for display/tracking (not sent to contract)
+  /** Human-readable description */
+  description?: string;
+  /** Token symbol for tokenIn */
+  tokenInSymbol?: string;
+  /** Token symbol for tokenOut */
+  tokenOutSymbol?: string;
+  /** Formatted input amount (e.g., "10.5") */
+  formattedAmountIn?: string;
+  /** Formatted output amount (e.g., "0.025") */
+  formattedAmountOut?: string;
+}
+
+/**
+ * Batch witness structure that the user signs
+ * Maps to the BatchWitness struct in Q402BatchExecutor.sol
+ */
+export interface BatchWitness {
+  /** User's wallet address */
+  owner: string;
+  /** Keccak256 hash of encoded operations array */
+  operationsHash: string;
+  /** Unix timestamp after which signature is invalid */
+  deadline: number;
+  /** Unique identifier for this batch (bytes32) */
+  batchId: string;
+  /** User's current nonce from the contract */
+  nonce: number;
+}
+
+/**
+ * EIP-712 Domain for BatchExecutor signatures
+ */
+export interface BatchExecutorDomain {
+  name: 'q402-batch';
+  version: '1';
+  chainId: number;
+  verifyingContract: string;
+}
+
+/**
+ * Complete batch payment request
+ */
+export interface BatchPaymentRequest {
+  /** Unique request ID */
+  id: string;
+  /** Chain ID */
+  chainId: number;
+  /** Array of operations to execute */
+  operations: BatchOperation[];
+  /** The witness structure to be signed */
+  witness: BatchWitness;
+  /** Request metadata */
+  metadata: {
+    action: string;
+    description: string;
+    totalValueUsd?: number;
+    operationCount: number;
+  };
+  /** Policy constraints */
+  policy?: {
+    maxGasPrice?: string;
+    deadline?: number;
+    atomicExecution?: boolean;
+  };
+  /** Creation timestamp */
+  createdAt: string;
+  /** Expiration timestamp */
+  expiresAt: string;
+}
+
+/**
+ * Typed data for signing a batch (EIP-712 format)
+ */
+export interface BatchSignedMessage {
+  domain: {
+    name: string;
+    version: string;
+    chainId: number;
+    verifyingContract: string;
+  };
+  types: {
+    BatchWitness: Array<{ name: string; type: string }>;
+  };
+  primaryType: 'BatchWitness';
+  message: BatchWitness;
+}
+
+/**
+ * Batch execution request sent to facilitator
+ */
+export interface BatchExecutionRequest {
+  /** Request/batch ID */
+  requestId: string;
+  /** The witness that was signed */
+  witness: BatchWitness;
+  /** Array of operations */
+  operations: BatchOperation[];
+  /** EIP-712 signature */
+  signature: string;
+  /** Signer's address */
+  signerAddress: string;
+}
+
+/**
+ * Result of batch execution
+ */
+export interface BatchExecutionResult {
+  success: boolean;
+  batchId: string;
+  txHash?: string;
+  blockNumber?: number;
+  gasUsed?: string;
+  /** Individual operation results */
+  operationResults?: Array<{
+    index: number;
+    success: boolean;
+    amountOut?: string;
+    error?: string;
+  }>;
+  error?: string;
+}
+
+/**
+ * Check if user needs to approve BatchExecutor for a token
+ */
+export interface BatchApprovalCheck {
+  needsApproval: boolean;
+  tokenAddress: string;
+  tokenSymbol?: string;
+  currentAllowance: bigint;
+  requiredAmount: bigint;
+  batchExecutorAddress: string;
+}
+
+/**
+ * Pending batch info stored when approval is needed
+ */
+export interface PendingBatchInfo {
+  /** Approval request ID */
+  approvalRequestId: string;
+  /** Session ID */
+  sessionId: string;
+  /** Network */
+  network: string;
+  /** User's wallet address */
+  walletAddress: string;
+  /** Operations in the pending batch */
+  operations: BatchOperation[];
+  /** Created timestamp */
+  createdAt: string;
+  /** Expiration timestamp */
+  expiresAt: string;
+}
+
 /**
  * Facilitator API response types
  */
@@ -267,3 +460,31 @@ export const Q402_WITNESS_TYPES: { Witness: Array<{ name: string; type: string }
     { name: 'nonce', type: 'uint256' },
   ],
 };
+
+/**
+ * EIP-712 type definitions for BatchWitness
+ */
+export const BATCH_WITNESS_TYPES = {
+  BatchWitness: [
+    { name: 'owner', type: 'address' },
+    { name: 'operationsHash', type: 'bytes32' },
+    { name: 'deadline', type: 'uint256' },
+    { name: 'batchId', type: 'bytes32' },
+    { name: 'nonce', type: 'uint256' },
+  ],
+} as const;
+
+/**
+ * EIP-712 type definitions for Operation (used to compute operationsHash)
+ */
+export const OPERATION_TYPES = {
+  Operation: [
+    { name: 'opType', type: 'uint8' },
+    { name: 'tokenIn', type: 'address' },
+    { name: 'amountIn', type: 'uint256' },
+    { name: 'tokenOut', type: 'address' },
+    { name: 'minAmountOut', type: 'uint256' },
+    { name: 'target', type: 'address' },
+    { name: 'data', type: 'bytes' },
+  ],
+} as const;

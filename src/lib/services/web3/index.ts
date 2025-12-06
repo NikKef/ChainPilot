@@ -33,6 +33,7 @@ export {
   buildQ402Approval,
   checkSwapApprovalNeeded,
   buildSwapApproval,
+  buildBatchExecutorApproval,
 } from './transactions';
 
 // Contracts

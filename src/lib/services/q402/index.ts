@@ -29,8 +29,12 @@ export {
   storePendingSwap,
   getPendingSwap,
   deletePendingSwap,
+  storePendingBatch,
+  getPendingBatch,
+  deletePendingBatch,
   type PendingTransferInfo,
   type PendingSwapInfo,
+  type PendingBatchInfo,
 } from './client';
 
 /**

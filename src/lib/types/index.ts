@@ -1,3 +1,6 @@
+// Re-export NetworkType from utils/constants for convenience
+export type { NetworkType } from '../utils/constants';
+
 // Intent types
 export * from './intent';
 

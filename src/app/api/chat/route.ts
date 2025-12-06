@@ -7,7 +7,11 @@ import {
   buildTokenTransfer, 
   buildSwap,
   createTransactionPreview,
-  getTokenInfo 
+  getTokenInfo,
+  checkQ402ApprovalNeeded,
+  buildQ402Approval,
+  checkSwapApprovalNeeded,
+  buildSwapApproval,
 } from '@/lib/services/web3';
 import { createAdminClient } from '@/lib/supabase/server';
 import { 
@@ -23,7 +27,9 @@ import {
 import { formatErrorResponse, getErrorStatusCode, ValidationError } from '@/lib/utils/errors';
 import { validateChatMessage, isValidNetwork } from '@/lib/utils/validation';
 import { logger } from '@/lib/utils';
-import { type NetworkType } from '@/lib/utils/constants';
+import { type NetworkType, Q402_FACILITATOR } from '@/lib/utils/constants';
+import { storePendingTransfer, storePendingSwap } from '@/lib/services/q402';
+import { formatUnits } from 'ethers';
 
 function intentNeedsFollowUp(intent: Intent): boolean {
   // Base check using required fields
@@ -166,13 +172,13 @@ export async function POST(request: NextRequest) {
           const parsedIntent =
             typeof lastAssistantWithIntent.intent === 'string'
               ? (JSON.parse(lastAssistantWithIntent.intent) as Intent)
-              : (lastAssistantWithIntent.intent as Intent);
+              : (lastAssistantWithIntent.intent as unknown as Intent);
 
           if (parsedIntent && intentNeedsFollowUp(parsedIntent)) {
             partialIntent = parsedIntent;
           }
-        } catch (error) {
-          logger.warn('Failed to parse intent from history', error);
+        } catch (e) {
+          logger.warn('Failed to parse intent from history', { error: e instanceof Error ? e.message : String(e) });
         }
       }
     }
@@ -445,17 +451,191 @@ async function buildResponse(
       let preparedTx;
       let tokenSymbol = transferIntent.tokenSymbol || 'BNB';
       
-      if (transferIntent.tokenAddress) {
-        preparedTx = await buildTokenTransfer(
+      // Validate tokenAddress is different from recipient (ChainGPT sometimes confuses them)
+      let effectiveTokenAddress = transferIntent.tokenAddress;
+      if (effectiveTokenAddress && effectiveTokenAddress.toLowerCase() === transferIntent.to.toLowerCase()) {
+        // Token address was incorrectly set to recipient address - clear it
+        logger.debug('Clearing tokenAddress that matches recipient address', { 
+          tokenAddress: effectiveTokenAddress, 
+          to: transferIntent.to 
+        });
+        effectiveTokenAddress = undefined;
+      }
+      
+      if (effectiveTokenAddress) {
+        // Validate the token contract first
+        try {
+          const tokenInfo = await getTokenInfo(effectiveTokenAddress, network);
+          tokenSymbol = tokenInfo.symbol;
+        } catch (error) {
+          // Invalid ERC20 contract - ask user to verify
+          const errorMessage = error instanceof Error ? error.message : 'Invalid token contract';
+          logger.warn('Failed to get token info', { 
+            tokenAddress: effectiveTokenAddress, 
+            network, 
+            error: errorMessage 
+          });
+          
+          // Clear the invalid token address so user can try again
+          const updatedIntent = { ...transferIntent, tokenAddress: undefined };
+          
+          return {
+            message: {
+              id: generateId(),
+              sessionId,
+              role: 'assistant',
+              content: errorMessage,
+              intent: updatedIntent,
+              createdAt: new Date().toISOString(),
+            },
+            intent: updatedIntent,
+            requiresFollowUp: true,
+            followUpQuestions: ['Please provide a valid ERC20 token contract address.'],
+          };
+        }
+        
+        // Check if user needs to approve Q402 contract before token transfer
+        const approvalCheck = await checkQ402ApprovalNeeded(
+          effectiveTokenAddress,
           walletAddress,
-          transferIntent.to,
-          transferIntent.tokenAddress,
           transferIntent.amount,
           network
         );
-        const tokenInfo = await getTokenInfo(transferIntent.tokenAddress, network);
-        tokenSymbol = tokenInfo.symbol;
+        
+        if (approvalCheck.needsApproval) {
+          // User needs to approve Q402 contract first
+          logger.info('Q402 approval needed', {
+            tokenAddress: effectiveTokenAddress,
+            walletAddress,
+            requiredAmount: approvalCheck.requiredAmount.toString(),
+            currentAllowance: approvalCheck.currentAllowance.toString(),
+            q402Contract: approvalCheck.q402ContractAddress,
+          });
+          
+          // Build approval transaction
+          const approvalTx = await buildQ402Approval(
+            walletAddress,
+            effectiveTokenAddress,
+            transferIntent.amount,
+            network
+          );
+          
+          const approvalPreview = await createTransactionPreview(
+            'contract_call',
+            approvalTx,
+            {
+              from: walletAddress,
+              network,
+              tokenSymbol,
+              tokenAddress: effectiveTokenAddress,
+              amount: transferIntent.amount,
+              methodName: 'approve',
+            }
+          );
+          
+          // Evaluate policy for approval
+          const policy = getDefaultPolicy(sessionId);
+          const policyEngine = createPolicyEngine(policy, network);
+          const approvalPolicyDecision = await policyEngine.evaluate(
+            'contract_call',
+            { targetAddress: effectiveTokenAddress },
+            0,
+            walletAddress
+          );
+          
+          const content = `Before transferring ${transferIntent.amount} ${tokenSymbol}, you need to approve the ChainPilot contract to spend your tokens.\n\n` +
+            `**Step 1 of 2**: Approve ${tokenSymbol} spending\n` +
+            `Contract: ${approvalCheck.q402ContractAddress.slice(0, 10)}...${approvalCheck.q402ContractAddress.slice(-8)}\n\n` +
+            `⚠️ **Note**: You will need to pay gas for this approval transaction (approvals must come directly from your wallet).\n\n` +
+            `After approval, the transfer will be gas-free and proceed automatically.`;
+          
+          // Generate a pending transfer ID
+          const pendingTransferId = `pending_${sessionId}_${Date.now()}`;
+          
+          // Store the pending transfer for automatic follow-up after approval
+          const now = new Date();
+          const expiresAt = new Date(now.getTime() + Q402_FACILITATOR.requestExpiryMs);
+          
+          storePendingTransfer({
+            approvalRequestId: pendingTransferId, // Will be updated when Q402 request is created
+            sessionId,
+            network,
+            walletAddress,
+            tokenAddress: effectiveTokenAddress,
+            tokenSymbol,
+            recipientAddress: transferIntent.to,
+            amount: transferIntent.amount,
+            createdAt: now.toISOString(),
+            expiresAt: expiresAt.toISOString(),
+          });
+          
+          logger.info('Stored pending transfer for automatic follow-up', {
+            pendingTransferId,
+            tokenAddress: effectiveTokenAddress,
+            recipient: transferIntent.to,
+            amount: transferIntent.amount,
+          });
+          
+          // Store the pending transfer intent for follow-up
+          const pendingTransferIntent = {
+            ...transferIntent,
+            _pendingApproval: true,
+            _pendingTransferId: pendingTransferId,
+          };
+          
+          return {
+            message: {
+              id: generateId(),
+              sessionId,
+              role: 'assistant',
+              content,
+              intent: pendingTransferIntent,
+              createdAt: new Date().toISOString(),
+            },
+            intent: pendingTransferIntent,
+            requiresFollowUp: false, // User needs to sign approval first
+            transactionPreview: approvalPreview,
+            policyDecision: approvalPolicyDecision,
+            approvalRequired: {
+              tokenAddress: effectiveTokenAddress,
+              tokenSymbol,
+              spenderAddress: approvalCheck.q402ContractAddress,
+              amount: transferIntent.amount,
+              currentAllowance: approvalCheck.currentAllowance.toString(),
+              requiredAmount: approvalCheck.requiredAmount.toString(),
+              pendingTransferId, // Include ID so frontend can pass it through
+              isDirectTransaction: true, // User must send this directly (pays gas) - approvals cannot be gas-sponsored
+            },
+          };
+        }
+        
+        preparedTx = await buildTokenTransfer(
+          walletAddress,
+          transferIntent.to,
+          effectiveTokenAddress,
+          transferIntent.amount,
+          network
+        );
+      } else if (transferIntent.tokenSymbol && 
+                 transferIntent.tokenSymbol.toUpperCase() !== 'BNB' && 
+                 transferIntent.tokenSymbol.toUpperCase() !== 'TBNB') {
+        // User specified a non-native token but we don't have the address - ask for it
+        const updatedIntent = { ...transferIntent };
+        return {
+          message: {
+            id: generateId(),
+            sessionId,
+            role: 'assistant',
+            content: `I need the contract address for ${transferIntent.tokenSymbol} to proceed with the transfer.`,
+            intent: updatedIntent,
+            createdAt: new Date().toISOString(),
+          },
+          intent: updatedIntent,
+          requiresFollowUp: true,
+          followUpQuestions: [`What is the contract address for ${transferIntent.tokenSymbol}?`],
+        };
       } else {
+        // Native BNB transfer
         preparedTx = await buildNativeTransfer(
           walletAddress,
           transferIntent.to,
@@ -523,14 +703,173 @@ async function buildResponse(
         };
       }
 
+      // Determine if this is a native BNB input (no approval needed) or token input (may need approval)
+      const isNativeIn = !swapIntent.tokenIn || swapIntent.tokenInSymbol?.toUpperCase() === 'BNB';
+      const tokenInSymbol = swapIntent.tokenInSymbol || (isNativeIn ? 'BNB' : 'Token');
+      const tokenOutSymbol = swapIntent.tokenOutSymbol || 'Token';
+      const slippageBps = swapIntent.slippageBps || 300;
+
+      // If token input (not native BNB), check if approval is needed for PancakeSwap router
+      if (!isNativeIn && swapIntent.tokenIn) {
+        const approvalCheck = await checkSwapApprovalNeeded(
+          swapIntent.tokenIn,
+          walletAddress,
+          swapIntent.amount,
+          network
+        );
+        
+        if (approvalCheck.needsApproval) {
+          // User needs to approve PancakeSwap router first
+          logger.info('Swap approval needed', {
+            tokenIn: swapIntent.tokenIn,
+            walletAddress,
+            requiredAmount: approvalCheck.requiredAmount.toString(),
+            currentAllowance: approvalCheck.currentAllowance.toString(),
+            routerAddress: approvalCheck.routerAddress,
+          });
+          
+          // Build approval transaction (user pays gas for approval)
+          const approvalTx = await buildSwapApproval(
+            walletAddress,
+            swapIntent.tokenIn,
+            network
+          );
+          
+          const approvalPreview = await createTransactionPreview(
+            'contract_call',
+            approvalTx,
+            {
+              from: walletAddress,
+              network,
+              tokenSymbol: tokenInSymbol,
+              tokenAddress: swapIntent.tokenIn,
+              amount: swapIntent.amount,
+              methodName: 'approve',
+            }
+          );
+          
+          // Evaluate policy for approval
+          const policy = getDefaultPolicy(sessionId);
+          const policyEngine = createPolicyEngine(policy, network);
+          const approvalPolicyDecision = await policyEngine.evaluate(
+            'contract_call',
+            { targetAddress: swapIntent.tokenIn },
+            0,
+            walletAddress
+          );
+          
+          // Generate a pending swap ID
+          const pendingSwapId = `pending_swap_${sessionId}_${Date.now()}`;
+          
+          // Store the pending swap for automatic follow-up after approval
+          const now = new Date();
+          const expiresAt = new Date(now.getTime() + Q402_FACILITATOR.requestExpiryMs);
+          
+          storePendingSwap({
+            approvalRequestId: pendingSwapId,
+            sessionId,
+            network,
+            walletAddress,
+            tokenIn: swapIntent.tokenIn,
+            tokenInSymbol,
+            tokenOut: swapIntent.tokenOut || null,
+            tokenOutSymbol,
+            amount: swapIntent.amount,
+            slippageBps,
+            createdAt: now.toISOString(),
+            expiresAt: expiresAt.toISOString(),
+          });
+          
+          logger.info('Stored pending swap for automatic follow-up', {
+            pendingSwapId,
+            tokenIn: swapIntent.tokenIn,
+            tokenOut: swapIntent.tokenOut,
+            amount: swapIntent.amount,
+          });
+          
+          // Get swap quote for display
+          const { getSwapQuote } = await import('@/lib/services/web3/swaps');
+          let estimatedOutput = '0';
+          try {
+            const quote = await getSwapQuote(
+              swapIntent.tokenIn,
+              swapIntent.tokenOut || 'native',
+              swapIntent.amount,
+              network,
+              slippageBps
+            );
+            // Get token decimals for formatting
+            const tokenOutInfo = swapIntent.tokenOut 
+              ? await getTokenInfo(swapIntent.tokenOut, network)
+              : { decimals: 18 };
+            estimatedOutput = formatUnits(quote.amountOut, tokenOutInfo.decimals);
+          } catch (e) {
+            logger.warn('Failed to get swap quote for preview', { error: e instanceof Error ? e.message : String(e) });
+          }
+          
+          // Store the pending swap intent for follow-up
+          const pendingSwapIntent = {
+            ...swapIntent,
+            _pendingApproval: true,
+            _pendingSwapId: pendingSwapId,
+          };
+          
+          const content = `Before swapping ${swapIntent.amount} ${tokenInSymbol} for ${tokenOutSymbol}, you need to approve the PancakeSwap router to spend your tokens.\n\n` +
+            `**Step 1 of 2**: Approve ${tokenInSymbol} spending\n` +
+            `Router: ${approvalCheck.routerAddress.slice(0, 10)}...${approvalCheck.routerAddress.slice(-8)}\n\n` +
+            `⚠️ **Note**: You will need to pay gas for both the approval and swap transactions.\n\n` +
+            `After approval, the swap will proceed automatically.\n\n` +
+            `📊 **Estimated swap**: ~${estimatedOutput} ${tokenOutSymbol}`;
+          
+          return {
+            message: {
+              id: generateId(),
+              sessionId,
+              role: 'assistant',
+              content,
+              intent: pendingSwapIntent,
+              createdAt: new Date().toISOString(),
+            },
+            intent: pendingSwapIntent,
+            requiresFollowUp: false,
+            transactionPreview: approvalPreview,
+            policyDecision: approvalPolicyDecision,
+            swapApprovalRequired: {
+              tokenInAddress: swapIntent.tokenIn,
+              tokenInSymbol,
+              tokenOutAddress: swapIntent.tokenOut || null,
+              tokenOutSymbol,
+              routerAddress: approvalCheck.routerAddress,
+              amount: swapIntent.amount,
+              currentAllowance: approvalCheck.currentAllowance.toString(),
+              requiredAmount: approvalCheck.requiredAmount.toString(),
+              pendingSwapId,
+              isDirectTransaction: true, // User must pay gas for approval
+              slippageBps,
+              estimatedOutput,
+            },
+          };
+        }
+      }
+
+      // No approval needed (native BNB input or already approved)
+      // Build the swap transaction
+      // NOTE: Swaps must be executed directly by the user (not via facilitator)
+      // because DEX routers pull tokens from msg.sender, which would be the facilitator
       const swapResult = await buildSwap(
         walletAddress,
         swapIntent.tokenIn || null,
         swapIntent.tokenOut || null,
         swapIntent.amount,
         network,
-        swapIntent.slippageBps || 300
+        slippageBps
       );
+
+      // Get formatted output amount
+      const tokenOutInfo = swapIntent.tokenOut 
+        ? await getTokenInfo(swapIntent.tokenOut, network)
+        : { decimals: 18, symbol: 'BNB' };
+      const formattedOutput = formatUnits(swapResult.quote.amountOut, tokenOutInfo.decimals);
 
       const preview = await createTransactionPreview(
         'swap',
@@ -539,10 +878,10 @@ async function buildResponse(
           from: walletAddress,
           network,
           amount: swapIntent.amount,
-          tokenInSymbol: swapIntent.tokenInSymbol || 'Token',
-          tokenOutSymbol: swapIntent.tokenOutSymbol || 'Token',
-          tokenOutAmount: swapResult.quote.amountOut,
-          slippageBps: swapIntent.slippageBps || 300,
+          tokenInSymbol,
+          tokenOutSymbol,
+          tokenOutAmount: formattedOutput,
+          slippageBps,
         }
       );
 
@@ -550,12 +889,15 @@ async function buildResponse(
       const policyEngine = createPolicyEngine(policy, network);
       const policyDecision = await policyEngine.evaluate(
         'swap',
-        { slippageBps: swapIntent.slippageBps || 300 },
+        { slippageBps },
         0,
         walletAddress
       );
 
-      const content = `Ready to swap ${swapIntent.amount} ${swapIntent.tokenInSymbol || 'tokens'} for approximately ${swapResult.quote.amountOut} ${swapIntent.tokenOutSymbol || 'tokens'}`;
+      // Note: Swaps require direct execution because DEX routers pull tokens from msg.sender
+      const content = `Ready to swap ${swapIntent.amount} ${tokenInSymbol} for approximately ${formattedOutput} ${tokenOutSymbol}.\n\n` +
+        `⚠️ **Note**: You will need to pay gas for this swap transaction.\n\n` +
+        `📊 **Slippage tolerance**: ${slippageBps / 100}%`;
 
       return {
         message: {
@@ -570,6 +912,8 @@ async function buildResponse(
         requiresFollowUp: false,
         transactionPreview: preview,
         policyDecision,
+        // Flag to indicate this must be executed directly, not via facilitator
+        isDirectTransaction: true,
       };
     }
 

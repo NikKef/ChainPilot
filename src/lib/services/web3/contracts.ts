@@ -28,7 +28,9 @@ export function parseAbi(abi: string | unknown[]): ContractAbi {
     } catch {
       // Try to parse as human-readable ABI
       const iface = new Interface([abi]);
-      return iface.format('json') as unknown as ContractAbi;
+      // In ethers v6, format() returns human-readable format by default
+      // We need to manually convert to JSON format
+      return JSON.parse(iface.formatJson()) as ContractAbi;
     }
   }
   return abi as ContractAbi;

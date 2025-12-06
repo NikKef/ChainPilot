@@ -88,29 +88,37 @@ export class TransactionSettler {
 
   /**
    * Settle a payment request on-chain
+   * 
+   * @param request - The settle request
+   * @param skipVerification - If true, skips signature verification (caller already verified)
    */
-  async settle(request: SettleRequest): Promise<SettleResponse> {
+  async settle(request: SettleRequest, skipVerification: boolean = false): Promise<SettleResponse> {
     const startTime = Date.now();
     
     try {
       logger.info('Starting settlement', {
         requestId: request.requestId,
         signer: request.signerAddress,
+        skipVerification,
       });
 
-      // 1. Verify signature first
-      const verification = await this.verifier.verify({
-        networkId: request.networkId,
-        witness: request.witness,
-        signature: request.signature,
-        signerAddress: request.signerAddress,
-      });
+      // 1. Verify signature (skip if already verified by caller)
+      if (!skipVerification) {
+        const verification = await this.verifier.verify({
+          networkId: request.networkId,
+          witness: request.witness,
+          signature: request.signature,
+          signerAddress: request.signerAddress,
+        });
 
-      if (!verification.valid) {
-        return {
-          success: false,
-          error: verification.error || 'Signature verification failed',
-        };
+        if (!verification.valid) {
+          return {
+            success: false,
+            error: verification.error || 'Signature verification failed',
+          };
+        }
+      } else {
+        logger.debug('Skipping verification (already verified by caller)');
       }
 
       // 2. Check budget limits
@@ -156,11 +164,27 @@ export class TransactionSettler {
       let txResponse: TransactionResponse;
       let txReceipt: EthersReceipt | null;
 
-      if (request.transaction) {
-        // Execute custom transaction (for transfers, swaps, etc.)
+      // Check if this is a token payment (non-native token in witness)
+      // For token payments, we MUST use the Q402 contract's executeTransfer
+      // because the facilitator cannot directly call ERC20.transfer (it doesn't own the tokens)
+      const isTokenPayment = request.witness.token !== '0x0000000000000000000000000000000000000000';
+      
+      if (isTokenPayment) {
+        // Token transfers MUST go through Q402 contract
+        // The Q402 contract will call transferFrom with user's prior approval
+        logger.info('Using Q402 contract for token transfer', {
+          token: request.witness.token,
+          amount: request.witness.amount,
+          owner: request.witness.owner,
+          recipient: request.witness.to,
+        });
+        txResponse = await this.executePaymentTransaction(request, gasPrice);
+      } else if (request.transaction && request.transaction.data && request.transaction.data !== '0x') {
+        // Custom contract interaction (swaps, other contract calls)
+        // These should be designed to use the user's funds via approval/permit
         txResponse = await this.executeCustomTransaction(request, gasPrice);
       } else {
-        // Execute Q402 payment contract call
+        // Native BNB payment via Q402 contract
         txResponse = await this.executePaymentTransaction(request, gasPrice);
       }
 
@@ -244,39 +268,74 @@ export class TransactionSettler {
     request: SettleRequest,
     gasPrice: bigint
   ): Promise<TransactionResponse> {
-    const params: ExecuteTransferParams = {
-      owner: request.witness.owner,
-      facilitator: this.config.sponsorAddress,
-      token: request.witness.token,
-      recipient: request.witness.to,
-      amount: request.witness.amount,
-      nonce: request.witness.nonce,
-      deadline: request.witness.deadline,
-      signature: request.signature,
-    };
+    // Ensure proper parameter types
+    const owner = getAddress(request.witness.owner);
+    const facilitator = getAddress(this.config.sponsorAddress);
+    const token = getAddress(request.witness.token);
+    const recipient = getAddress(request.witness.to);
+    const amount = BigInt(request.witness.amount);
+    const nonce = BigInt(request.witness.nonce);
+    const deadline = BigInt(request.witness.deadline);
+    const signature = request.signature;
 
     logger.info('Executing payment transaction', {
-      owner: params.owner,
-      token: params.token,
-      amount: params.amount,
-      recipient: params.recipient,
+      owner,
+      facilitator,
+      token,
+      amount: amount.toString(),
+      recipient,
+      nonce: nonce.toString(),
+      deadline: deadline.toString(),
+      signatureLength: signature?.length,
+      signaturePreview: signature?.slice(0, 20),
+    });
+
+    // Try a static call first to see if it would revert
+    try {
+      await this.implementationContract.executeTransfer.staticCall(
+        owner,
+        facilitator,
+        token,
+        recipient,
+        amount,
+        nonce,
+        deadline,
+        signature
+      );
+      logger.debug('Static call passed - transaction should succeed');
+    } catch (staticCallError) {
+      logger.error('Static call failed - transaction would revert', {
+        error: staticCallError instanceof Error ? staticCallError.message : String(staticCallError),
+      });
+      // Still try the actual transaction to get the on-chain error
+    }
+
+    // Populate the transaction to see the encoded data
+    const populatedTx = await this.implementationContract.executeTransfer.populateTransaction(
+      owner,
+      facilitator,
+      token,
+      recipient,
+      amount,
+      nonce,
+      deadline,
+      signature
+    );
+
+    logger.debug('Populated executeTransfer transaction', {
+      to: populatedTx.to,
+      data: populatedTx.data?.slice(0, 138),
+      dataLength: populatedTx.data?.length,
     });
 
     // Call the implementation contract
-    const tx = await this.implementationContract.executeTransfer(
-      params.owner,
-      params.facilitator,
-      params.token,
-      params.recipient,
-      params.amount,
-      params.nonce,
-      params.deadline,
-      params.signature,
-      {
-        gasLimit: this.config.maxGasLimit,
-        gasPrice,
-      }
-    );
+    const tx = await this.sponsorWallet.sendTransaction({
+      to: this.config.implementationContract,
+      data: populatedTx.data,
+      value: BigInt(0),
+      gasLimit: this.config.maxGasLimit,
+      gasPrice,
+    });
 
     return tx;
   }
@@ -306,13 +365,13 @@ export class TransactionSettler {
       to: request.transaction.to,
       value: request.transaction.value,
       hasData,
-      isNativeTransfer: txValue > 0n && !hasData,
+      isNativeTransfer: txValue > BigInt(0) && !hasData,
     });
 
     // SECURITY CHECK: Prevent facilitator from sending its own funds
     // Native BNB transfers (value > 0 with no contract data) are NOT supported
     // via facilitator because we cannot move user's native BNB without their direct signature
-    if (txValue > 0n && !hasData) {
+    if (txValue > BigInt(0) && !hasData) {
       logger.error('SECURITY: Native BNB transfers cannot be executed via facilitator', {
         requestedValue: formatUnits(txValue, 18),
         to: request.transaction.to,
@@ -330,20 +389,48 @@ export class TransactionSettler {
     // The contract should be designed to use the user's funds via approval/permit
     // The facilitator only pays gas - the actual tokens come from the user
     if (hasData) {
+      // Extract and validate transaction data
+      const txTo = request.transaction.to;
+      const txData = request.transaction.data;
+      
+      // Ensure data is a valid hex string
+      if (!txData || txData === '0x' || txData.length < 10) {
+        throw new Error(`Invalid transaction data: ${txData}`);
+      }
+      
       logger.info('Executing contract interaction with gas sponsorship', {
-        to: request.transaction.to,
-        dataLength: request.transaction.data?.length,
+        to: txTo,
+        dataLength: txData.length,
+        dataPreview: txData.slice(0, 74), // Show function selector + first param
       });
 
-      // Execute the contract call - facilitator pays gas only
-      // The contract call itself should transfer from USER's balance, not facilitator's
-      const tx = await this.sponsorWallet.sendTransaction({
-        to: request.transaction.to,
-        data: request.transaction.data,
-        value: 0n, // Facilitator should NOT send any value
-        gasLimit: this.config.maxGasLimit,
+      // Get the current nonce for the sponsor wallet
+      const nonce = await this.provider.getTransactionCount(this.config.sponsorAddress, 'pending');
+      
+      // Populate the transaction fully before sending
+      // This ensures ethers.js doesn't modify any fields
+      const populatedTx = await this.sponsorWallet.populateTransaction({
+        to: txTo,
+        data: txData,
+        value: BigInt(0),
+        gasLimit: BigInt(this.config.maxGasLimit),
         gasPrice,
+        nonce,
+        chainId: this.config.chainId,
       });
+      
+      logger.debug('Populated transaction', {
+        to: populatedTx.to,
+        data: populatedTx.data?.toString().slice(0, 74),
+        dataLength: populatedTx.data?.toString().length,
+        nonce: populatedTx.nonce?.toString(),
+        chainId: populatedTx.chainId?.toString(),
+        gasLimit: populatedTx.gasLimit?.toString(),
+        gasPrice: populatedTx.gasPrice?.toString(),
+      });
+
+      // Sign and send the transaction
+      const tx = await this.sponsorWallet.sendTransaction(populatedTx);
 
       return tx;
     }

@@ -7,13 +7,31 @@ import type {
   Q402BatchRequest,
   Q402BatchResult,
 } from './types';
-import { Q402Client, createQ402Client } from './client';
+import { 
+  Q402Client, 
+  createQ402Client,
+  storePendingTransfer,
+  getPendingTransfer,
+  deletePendingTransfer,
+  type PendingTransferInfo,
+} from './client';
 import { type NetworkType } from '@/lib/utils/constants';
 import { logger } from '@/lib/utils';
 import { TransactionError } from '@/lib/utils/errors';
 
 export * from './types';
-export { Q402Client, createQ402Client } from './client';
+export { 
+  Q402Client, 
+  createQ402Client,
+  storePendingTransfer,
+  getPendingTransfer,
+  deletePendingTransfer,
+  storePendingSwap,
+  getPendingSwap,
+  deletePendingSwap,
+  type PendingTransferInfo,
+  type PendingSwapInfo,
+} from './client';
 
 /**
  * Q402 Service - Main entry point for gas-sponsored sign-to-pay transactions
@@ -47,13 +65,23 @@ export class Q402Service {
       amount?: string;
       ownerAddress?: string;
       nonce?: number;
+      recipientAddress?: string; // Actual recipient for transfers
     }
   ): Promise<{
     request: Q402PaymentRequest;
     typedData: Q402SignedMessage;
     ethersTypedData?: ReturnType<Q402Client['createEthersTypedData']>;
   }> {
-    logger.q402('prepareTransaction', { action });
+    logger.q402('prepareTransaction', { action, recipientAddress: options?.recipientAddress });
+
+    // Fetch the current nonce from the contract if owner address is provided and nonce not specified
+    const ownerAddress = options?.ownerAddress || '0x0000000000000000000000000000000000000000';
+    let nonce = options?.nonce;
+    
+    if (nonce === undefined && ownerAddress !== '0x0000000000000000000000000000000000000000') {
+      nonce = await this.client.getNonce(ownerAddress);
+      logger.q402('Fetched nonce for transaction', { ownerAddress, nonce });
+    }
 
     const request = await this.client.createPaymentRequest(
       preparedTx,
@@ -65,16 +93,16 @@ export class Q402Service {
       {
         tokenAddress: options?.tokenAddress,
         amount: options?.amount,
-        nonce: options?.nonce,
+        nonce,
+        recipientAddress: options?.recipientAddress,
       }
     );
 
     // Create typed data for signing
-    const ownerAddress = options?.ownerAddress || '0x0000000000000000000000000000000000000000';
-    const typedData = this.client.createTypedDataForSigning(request, ownerAddress, options?.nonce);
+    const typedData = this.client.createTypedDataForSigning(request, ownerAddress, nonce);
     
     // Also create ethers.js compatible typed data
-    const ethersTypedData = this.client.createEthersTypedData(request, ownerAddress, options?.nonce);
+    const ethersTypedData = this.client.createEthersTypedData(request, ownerAddress, nonce);
 
     return { request, typedData, ethersTypedData };
   }
@@ -267,6 +295,7 @@ export class TransactionExecutor {
       ownerAddress?: string;
       tokenAddress?: string;
       amount?: string;
+      recipientAddress?: string; // Actual recipient for transfers
     }
   ): Promise<{
     allowed: boolean;
@@ -297,6 +326,7 @@ export class TransactionExecutor {
         ownerAddress: options?.ownerAddress,
         tokenAddress: options?.tokenAddress,
         amount: options?.amount,
+        recipientAddress: options?.recipientAddress,
       }
     );
 

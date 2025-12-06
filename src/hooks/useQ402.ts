@@ -21,12 +21,24 @@ export interface Q402SigningState {
 }
 
 /**
+ * Next transaction info (for multi-step flows like approval + transfer)
+ */
+export interface NextTransactionInfo {
+  message: string;
+  requestId: string;
+  typedData: Q402SignedMessage;
+  preview: TransactionPreview;
+  expiresAt: string;
+}
+
+/**
  * Q402 signing options
  */
 export interface Q402SigningOptions {
   onPrepared?: (request: Q402PaymentRequest) => void;
   onSigned?: (signature: string) => void;
   onExecuted?: (result: TransactionResult) => void;
+  onNextTransaction?: (next: NextTransactionInfo) => void;
   onError?: (error: Error) => void;
 }
 
@@ -39,7 +51,8 @@ export interface UseQ402Return {
     preview: TransactionPreview,
     policyDecision: PolicyEvaluationResult,
     sessionId: string,
-    provider: BrowserProvider
+    provider: BrowserProvider,
+    pendingTransferId?: string
   ) => Promise<TransactionResult | null>;
   signTypedData: (
     provider: BrowserProvider,
@@ -49,7 +62,13 @@ export interface UseQ402Return {
     sessionId: string,
     requestId: string,
     signature: string,
-    signerAddress: string
+    signerAddress: string,
+    pendingTransferId?: string
+  ) => Promise<{ result: TransactionResult | null; nextTransaction?: NextTransactionInfo }>;
+  signNextTransaction: (
+    sessionId: string,
+    next: NextTransactionInfo,
+    provider: BrowserProvider
   ) => Promise<TransactionResult | null>;
   reset: () => void;
 }
@@ -193,8 +212,9 @@ export function useQ402(options: Q402SigningOptions = {}): UseQ402Return {
     sessionId: string,
     requestId: string,
     signature: string,
-    signerAddress: string
-  ): Promise<TransactionResult | null> => {
+    signerAddress: string,
+    pendingTransferId?: string
+  ): Promise<{ result: TransactionResult | null; nextTransaction?: NextTransactionInfo }> => {
     setState(prev => ({ ...prev, isExecuting: true, error: null }));
 
     try {
@@ -208,6 +228,7 @@ export function useQ402(options: Q402SigningOptions = {}): UseQ402Return {
           actionLogId: requestId,
           signature,
           signerAddress,
+          pendingTransferId,
         }),
       });
 
@@ -222,23 +243,73 @@ export function useQ402(options: Q402SigningOptions = {}): UseQ402Return {
       setState(prev => ({ ...prev, isExecuting: false, result }));
       options.onExecuted?.(result);
 
-      return result;
+      // Check if there's a next transaction to sign
+      if (data.nextTransaction) {
+        console.log('[Q402] Next transaction available:', data.nextTransaction);
+        options.onNextTransaction?.(data.nextTransaction);
+      }
+
+      return { result, nextTransaction: data.nextTransaction };
     } catch (error) {
       const err = error instanceof Error ? error : new Error('Failed to execute transaction');
       setState(prev => ({ ...prev, isExecuting: false, error: err }));
       options.onError?.(err);
-      return null;
+      return { result: null };
     }
   }, [options]);
 
   /**
-   * Full flow: prepare -> sign -> execute
+   * Sign and execute a next transaction (follow-up after approval)
+   */
+  const signNextTransaction = useCallback(async (
+    sessionId: string,
+    next: NextTransactionInfo,
+    provider: BrowserProvider
+  ): Promise<TransactionResult | null> => {
+    setState(prev => ({ ...prev, isLoading: true, isSigning: true, error: null }));
+
+    try {
+      const signer = await provider.getSigner();
+      const signerAddress = await signer.getAddress();
+
+      console.log('[Q402] Signing next transaction:', next.requestId);
+      
+      // Sign the typed data for the next transaction
+      const signature = await signTypedData(provider, next.typedData);
+      
+      if (!signature) {
+        console.log('[Q402] User cancelled next transaction signature');
+        setState(prev => ({ ...prev, isLoading: false, isSigning: false }));
+        return null;
+      }
+
+      // Execute the next transaction
+      const { result } = await executeTransaction(
+        sessionId,
+        next.requestId,
+        signature,
+        signerAddress
+      );
+
+      setState(prev => ({ ...prev, isLoading: false }));
+      return result;
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error('Failed to sign next transaction');
+      setState(prev => ({ ...prev, isLoading: false, isSigning: false, error: err }));
+      options.onError?.(err);
+      return null;
+    }
+  }, [options, signTypedData, executeTransaction]);
+
+  /**
+   * Full flow: prepare -> sign -> execute (with automatic follow-up for multi-step transactions)
    */
   const prepareAndSign = useCallback(async (
     preview: TransactionPreview,
     policyDecision: PolicyEvaluationResult,
     sessionId: string,
-    provider: BrowserProvider
+    provider: BrowserProvider,
+    pendingTransferId?: string
   ): Promise<TransactionResult | null> => {
     setState(prev => ({ ...prev, isLoading: true, isPreparing: true, error: null }));
 
@@ -334,7 +405,28 @@ export function useQ402(options: Q402SigningOptions = {}): UseQ402Return {
 
       // Step 3: Execute the transaction with the server-generated requestId
       console.log('[Q402] Executing transaction with requestId:', requestId);
-      const result = await executeTransaction(sessionId, requestId, signature, signerAddress);
+      console.log('[Q402] pendingTransferId:', pendingTransferId);
+      
+      const { result, nextTransaction } = await executeTransaction(
+        sessionId, 
+        requestId, 
+        signature, 
+        signerAddress,
+        pendingTransferId
+      );
+      
+      // Step 4: If there's a next transaction (e.g., after approval), sign and execute it
+      if (nextTransaction && result?.success) {
+        console.log('[Q402] Automatically signing next transaction...');
+        
+        // Give a brief pause for the user to see the approval success
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+        const nextResult = await signNextTransaction(sessionId, nextTransaction, provider);
+        
+        setState(prev => ({ ...prev, isLoading: false }));
+        return nextResult;
+      }
       
       setState(prev => ({ ...prev, isLoading: false }));
       return result;
@@ -349,13 +441,14 @@ export function useQ402(options: Q402SigningOptions = {}): UseQ402Return {
       options.onError?.(err);
       return null;
     }
-  }, [options, signTypedData, executeTransaction]);
+  }, [options, signTypedData, executeTransaction, signNextTransaction]);
 
   return {
     state,
     prepareAndSign,
     signTypedData,
     executeTransaction,
+    signNextTransaction,
     reset,
   };
 }

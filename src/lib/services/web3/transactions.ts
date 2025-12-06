@@ -38,7 +38,7 @@ export async function buildNativeTransfer(
     to,
     data: '0x',
     value: value.toString(),
-    gasLimit: (gasEstimate * 120n / 100n).toString(), // 20% buffer
+    gasLimit: (gasEstimate * BigInt(120) / BigInt(100)).toString(), // 20% buffer
     gasPrice: feeData.gasPrice.toString(),
   };
 }
@@ -66,6 +66,13 @@ export async function buildTokenTransfer(
   const iface = new Interface(ERC20_ABI);
   const data = iface.encodeFunctionData('transfer', [to, amountWei]);
 
+  logger.debug('Token transfer data encoded', {
+    functionSelector: data.slice(0, 10),
+    dataLength: data.length,
+    recipient: to,
+    amountWei: amountWei.toString(),
+  });
+
   // Estimate gas
   const gasEstimate = await estimateGas(
     { from, to: tokenAddress, data },
@@ -74,13 +81,22 @@ export async function buildTokenTransfer(
 
   const feeData = await getFeeData(network);
 
-  return {
+  const preparedTx: PreparedTx = {
     to: tokenAddress,
     data,
     value: '0',
-    gasLimit: (gasEstimate * 120n / 100n).toString(),
+    gasLimit: (gasEstimate * BigInt(120) / BigInt(100)).toString(),
     gasPrice: feeData.gasPrice.toString(),
   };
+
+  logger.debug('Prepared token transfer transaction', {
+    to: preparedTx.to,
+    dataLength: preparedTx.data.length,
+    dataPreview: preparedTx.data.slice(0, 74),
+    value: preparedTx.value,
+  });
+
+  return preparedTx;
 }
 
 /**
@@ -118,7 +134,7 @@ export async function buildApproval(
     to: tokenAddress,
     data,
     value: '0',
-    gasLimit: (gasEstimate * 120n / 100n).toString(),
+    gasLimit: (gasEstimate * BigInt(120) / BigInt(100)).toString(),
     gasPrice: feeData.gasPrice.toString(),
   };
 }
@@ -145,7 +161,7 @@ export async function buildContractCall(
   const data = iface.encodeFunctionData(methodName, args);
 
   // Parse value
-  const valueWei = value === '0' ? 0n : parseUnits(value, 18);
+  const valueWei = value === '0' ? BigInt(0) : parseUnits(value, 18);
 
   // Estimate gas
   const gasEstimate = await estimateGas(
@@ -159,7 +175,7 @@ export async function buildContractCall(
     to: contractAddress,
     data,
     value: valueWei.toString(),
-    gasLimit: (gasEstimate * 150n / 100n).toString(), // 50% buffer for complex calls
+    gasLimit: (gasEstimate * BigInt(150) / BigInt(100)).toString(), // 50% buffer for complex calls
     gasPrice: feeData.gasPrice.toString(),
   };
 }
@@ -190,7 +206,7 @@ export async function buildDeployment(
     to: '', // Empty for deployment
     data,
     value: '0',
-    gasLimit: (gasEstimate * 130n / 100n).toString(), // 30% buffer
+    gasLimit: (gasEstimate * BigInt(130) / BigInt(100)).toString(), // 30% buffer
     gasPrice: feeData.gasPrice.toString(),
   };
 }
@@ -225,6 +241,9 @@ export async function estimateTransactionGas(
 
 /**
  * Get ERC20 token info
+ * Returns token info if the address is a valid ERC20 contract
+ * Some tokens may have non-standard implementations, so we're tolerant of missing name/symbol
+ * but decimals() is required for transfers
  */
 export async function getTokenInfo(
   tokenAddress: string,
@@ -238,18 +257,40 @@ export async function getTokenInfo(
   const provider = getProvider(network);
   const contract = new Contract(tokenAddress, ERC20_ABI, provider);
 
-  const [name, symbol, decimals] = await Promise.all([
-    contract.name(),
-    contract.symbol(),
-    contract.decimals(),
-  ]);
+  try {
+    // decimals() is essential for transfers - if this fails, the token is not usable
+    const decimals = await contract.decimals();
+    
+    // name() and symbol() are optional - some tokens don't implement them
+    let name = 'Unknown Token';
+    let symbol = 'TOKEN';
+    
+    try {
+      name = await contract.name();
+    } catch {
+      logger.debug('Token does not have name() function', { tokenAddress });
+    }
+    
+    try {
+      symbol = await contract.symbol();
+    } catch {
+      logger.debug('Token does not have symbol() function', { tokenAddress });
+    }
 
-  return {
-    address: tokenAddress,
-    name,
-    symbol,
-    decimals: Number(decimals),
-  };
+    return {
+      address: tokenAddress,
+      name,
+      symbol,
+      decimals: Number(decimals),
+    };
+  } catch (error) {
+    // Handle ethers.js call exceptions with a friendly message
+    logger.error('Failed to get token info', { tokenAddress, network, error });
+    throw new Web3Error(
+      `Unable to fetch token information for ${tokenAddress}. Please verify this is a valid BEP20/ERC20 token contract address on ${network}.`,
+      { code: 'TOKEN_INFO_FETCH_FAILED', tokenAddress, network }
+    );
+  }
 }
 
 /**
@@ -291,6 +332,155 @@ export async function getAllowance(
   const provider = getProvider(network);
   const contract = new Contract(tokenAddress, ERC20_ABI, provider);
   return contract.allowance(owner, spender);
+}
+
+/**
+ * Check if Q402 contract has sufficient allowance for a token transfer
+ * Returns true if approval is needed, false if sufficient allowance exists
+ */
+export async function checkQ402ApprovalNeeded(
+  tokenAddress: string,
+  ownerAddress: string,
+  amount: string,
+  network: NetworkType
+): Promise<{
+  needsApproval: boolean;
+  currentAllowance: bigint;
+  requiredAmount: bigint;
+  q402ContractAddress: string;
+}> {
+  // Import Q402 contract address
+  const { Q402_CONTRACTS } = await import('@/lib/utils/constants');
+  const q402ContractAddress = Q402_CONTRACTS[network].implementation;
+  
+  // Get token decimals
+  const provider = getProvider(network);
+  const tokenContract = new Contract(tokenAddress, ERC20_ABI, provider);
+  const decimals = await tokenContract.decimals();
+  
+  // Parse amount to wei
+  const requiredAmount = parseUnits(amount, decimals);
+  
+  // Check current allowance
+  const currentAllowance = await getAllowance(tokenAddress, ownerAddress, q402ContractAddress, network);
+  
+  logger.debug('Q402 approval check', {
+    tokenAddress,
+    ownerAddress,
+    q402ContractAddress,
+    requiredAmount: requiredAmount.toString(),
+    currentAllowance: currentAllowance.toString(),
+    needsApproval: currentAllowance < requiredAmount,
+  });
+  
+  return {
+    needsApproval: currentAllowance < requiredAmount,
+    currentAllowance,
+    requiredAmount,
+    q402ContractAddress,
+  };
+}
+
+/**
+ * Build an approval transaction for the Q402 contract
+ */
+export async function buildQ402Approval(
+  from: string,
+  tokenAddress: string,
+  amount: string,
+  network: NetworkType
+): Promise<PreparedTx> {
+  const { Q402_CONTRACTS } = await import('@/lib/utils/constants');
+  const q402ContractAddress = Q402_CONTRACTS[network].implementation;
+  
+  // Build approval for the Q402 contract
+  return buildApproval(from, tokenAddress, q402ContractAddress, amount, network);
+}
+
+/**
+ * Check if PancakeSwap router has sufficient allowance for a token swap
+ * Returns true if approval is needed, false if sufficient allowance exists
+ */
+export async function checkSwapApprovalNeeded(
+  tokenAddress: string,
+  ownerAddress: string,
+  amount: string,
+  network: NetworkType
+): Promise<{
+  needsApproval: boolean;
+  currentAllowance: bigint;
+  requiredAmount: bigint;
+  routerAddress: string;
+}> {
+  // Import PancakeSwap router address
+  const { PANCAKE_ROUTER } = await import('@/lib/utils/constants');
+  const routerAddress = PANCAKE_ROUTER[network];
+  
+  // Get token decimals
+  const provider = getProvider(network);
+  const tokenContract = new Contract(tokenAddress, ERC20_ABI, provider);
+  const decimals = await tokenContract.decimals();
+  
+  // Parse amount to wei
+  const requiredAmount = parseUnits(amount, decimals);
+  
+  // Check current allowance
+  const currentAllowance = await getAllowance(tokenAddress, ownerAddress, routerAddress, network);
+  
+  logger.debug('Swap approval check', {
+    tokenAddress,
+    ownerAddress,
+    routerAddress,
+    requiredAmount: requiredAmount.toString(),
+    currentAllowance: currentAllowance.toString(),
+    needsApproval: currentAllowance < requiredAmount,
+  });
+  
+  return {
+    needsApproval: currentAllowance < requiredAmount,
+    currentAllowance,
+    requiredAmount,
+    routerAddress,
+  };
+}
+
+/**
+ * Build an approval transaction for the PancakeSwap router
+ * Uses max uint256 for unlimited approval (common for DEX routers)
+ */
+export async function buildSwapApproval(
+  from: string,
+  tokenAddress: string,
+  network: NetworkType
+): Promise<PreparedTx> {
+  logger.web3Tx('buildSwapApproval', { from, tokenAddress, network });
+
+  const { PANCAKE_ROUTER } = await import('@/lib/utils/constants');
+  const routerAddress = PANCAKE_ROUTER[network];
+  
+  // Use max uint256 for unlimited approval (standard for DEX routers)
+  // This is already in wei, so we pass it directly to the encoder as a BigInt
+  const maxApproval = BigInt('115792089237316195423570985008687907853269984665640564039457584007913129639935');
+  
+  // Encode approve call directly (bypassing parseUnits since maxApproval is already in wei)
+  const iface = new Interface(ERC20_ABI);
+  const data = iface.encodeFunctionData('approve', [routerAddress, maxApproval]);
+
+  // Estimate gas
+  const gasEstimate = await estimateGas(
+    { from, to: tokenAddress, data },
+    network
+  );
+
+  const feeData = await getFeeData(network);
+
+  return {
+    to: tokenAddress,
+    data,
+    value: '0',
+    gasLimit: (gasEstimate * BigInt(120) / BigInt(100)).toString(),
+    gasPrice: feeData.gasPrice.toString(),
+  };
 }
 
 /**

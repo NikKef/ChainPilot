@@ -108,8 +108,11 @@ export class FacilitatorService {
 
   /**
    * Settle a payment on-chain
+   * 
+   * @param request - The settle request
+   * @param skipVerification - If true, skips signature verification (caller already verified)
    */
-  async settle(request: SettleRequest): Promise<SettleResponse> {
+  async settle(request: SettleRequest, skipVerification: boolean = false): Promise<SettleResponse> {
     const settler = this.settlers.get(request.networkId);
     
     if (!settler) {
@@ -119,7 +122,7 @@ export class FacilitatorService {
       };
     }
 
-    return settler.settle(request);
+    return settler.settle(request, skipVerification);
   }
 
   /**

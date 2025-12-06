@@ -39,11 +39,13 @@ export const Q402_CONTRACTS = {
     implementation: process.env.Q402_IMPLEMENTATION_TESTNET || '0x0000000000000000000000000000000000000001', // Q402 Implementation Contract
     verifier: process.env.Q402_VERIFIER_TESTNET || '0x0000000000000000000000000000000000000002', // EIP-712 Verifying Contract
     facilitatorWallet: process.env.Q402_FACILITATOR_WALLET_TESTNET || '0x0000000000000000000000000000000000000003', // Gas sponsor wallet
+    vault: process.env.Q402_VAULT_TESTNET || '', // Q402 Vault Contract for deposits
   },
   mainnet: {
     implementation: process.env.Q402_IMPLEMENTATION_MAINNET || '0x0000000000000000000000000000000000000001',
     verifier: process.env.Q402_VERIFIER_MAINNET || '0x0000000000000000000000000000000000000002',
     facilitatorWallet: process.env.Q402_FACILITATOR_WALLET_MAINNET || '0x0000000000000000000000000000000000000003',
+    vault: process.env.Q402_VAULT_MAINNET || '', // Q402 Vault Contract for deposits
   },
 } as const;
 

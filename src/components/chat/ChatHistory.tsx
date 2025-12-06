@@ -206,8 +206,8 @@ interface ConversationItemProps {
   onEditTitleChange: (title: string) => void;
   onKeyDown: (e: React.KeyboardEvent) => void;
   onMenuToggle: () => void;
-  editInputRef: React.RefObject<HTMLInputElement>;
-  menuRef: React.RefObject<HTMLDivElement>;
+  editInputRef: React.RefObject<HTMLInputElement | null>;
+  menuRef: React.RefObject<HTMLDivElement | null>;
 }
 
 function ConversationItem({

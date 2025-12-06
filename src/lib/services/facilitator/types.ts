@@ -308,6 +308,18 @@ export const Q402_IMPLEMENTATION_ABI = [
 ] as const;
 
 /**
+ * Q402 Vault contract ABI for deposits/withdrawals
+ */
+export const Q402_VAULT_ABI = [
+  'function deposit() external payable',
+  'function withdraw(uint256 amount) external',
+  'function withdrawAll() external',
+  'function getBalance(address account) external view returns (uint256)',
+  'event Deposited(address indexed account, uint256 amount)',
+  'event Withdrawn(address indexed account, uint256 amount)',
+] as const;
+
+/**
  * EIP-712 domain for witness verification
  */
 export interface EIP712Domain {

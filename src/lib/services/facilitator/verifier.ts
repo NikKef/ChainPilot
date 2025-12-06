@@ -203,36 +203,38 @@ export class SignatureVerifier {
 
   /**
    * Validate nonce for an address
+   * 
+   * NOTE: The on-chain contract is the source of truth for nonce validation.
+   * The internal nonce tracking is for optimization only (to avoid unnecessary RPC calls).
+   * If there's a mismatch, we trust the contract and let it validate.
    */
   validateNonce(address: string, nonce: number): NonceValidation {
     const normalizedAddress = getAddress(address).toLowerCase();
     const record = this.nonceRecords.get(normalizedAddress);
 
     if (!record) {
-      // First transaction from this address
+      // First transaction from this address in this session
+      // The contract will validate the actual nonce
       return {
         valid: true,
         currentNonce: 0,
       };
     }
 
-    // Check if nonce was already used
-    if (record.usedNonces.has(nonce)) {
-      return {
-        valid: false,
-        currentNonce: record.currentNonce,
-        error: `Nonce ${nonce} already used for address ${address}`,
-      };
-    }
-
-    // Nonce should be >= current nonce (allow gaps for parallel transactions)
-    if (nonce < record.currentNonce) {
-      return {
-        valid: false,
-        currentNonce: record.currentNonce,
-        error: `Nonce ${nonce} is less than current nonce ${record.currentNonce}`,
-      };
-    }
+    // For now, trust the provided nonce and let the contract validate
+    // The contract's getNonce() was called when preparing the transaction,
+    // so the nonce should be correct. If not, the contract will reject.
+    // 
+    // This avoids issues where in-memory tracking gets out of sync with
+    // on-chain state (e.g., after server restarts or when transactions
+    // are submitted through other means).
+    
+    logger.debug('Nonce validation', {
+      address: normalizedAddress,
+      providedNonce: nonce,
+      inMemoryCurrentNonce: record.currentNonce,
+      // Note: We're not blocking based on in-memory tracking anymore
+    });
 
     return {
       valid: true,

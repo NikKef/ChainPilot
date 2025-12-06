@@ -29,6 +29,10 @@ export {
   getTokenBalance,
   getAllowance,
   createTransactionPreview,
+  checkQ402ApprovalNeeded,
+  buildQ402Approval,
+  checkSwapApprovalNeeded,
+  buildSwapApproval,
 } from './transactions';
 
 // Contracts

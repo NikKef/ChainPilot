@@ -143,10 +143,10 @@ IMPORTANT: Return ONLY valid JSON. Do not include any text before or after the J
 
     const history =
       sessionContext.chatHistory && sessionContext.chatHistory.length
-        ? sessionContext.chatHistory.map((m) => ({
+        ? JSON.stringify(sessionContext.chatHistory.map((m) => ({
             role: m.role,
             content: m.content,
-          }))
+          })))
         : 'off';
 
     const response = await client.createChatBlob({
@@ -285,7 +285,7 @@ function mergeIntents(partial: Partial<Intent>, newIntent: Intent): Intent {
     });
     
     // Extract any useful values from the new intent (like addresses)
-    const newValues: Partial<Intent> = {};
+    const newValues: Record<string, unknown> = {};
     
     // If new intent has an address, use it to fill missing fields in partial
     if ('address' in newIntent && newIntent.address) {

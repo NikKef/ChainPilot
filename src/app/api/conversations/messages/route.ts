@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/server';
 import { formatErrorResponse, getErrorStatusCode, ValidationError } from '@/lib/utils/errors';
 import { logger } from '@/lib/utils';
-import type { ChatMessage } from '@/lib/types';
+import type { ChatMessage, Intent } from '@/lib/types';
 
 export interface GetMessagesResponse {
   messages: ChatMessage[];
@@ -54,7 +54,7 @@ export async function GET(request: NextRequest) {
       conversationId: msg.conversation_id,
       role: msg.role,
       content: msg.content,
-      intent: msg.intent,
+      intent: msg.intent ? (msg.intent as unknown as Intent) : undefined,
       createdAt: msg.created_at,
     }));
 

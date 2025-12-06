@@ -30,7 +30,7 @@ export function VaultPanel({ className }: VaultPanelProps) {
   const [showSuccess, setShowSuccess] = useState<string | null>(null);
   
   // Default to testnet for now
-  const network: NetworkType = 'testnet';
+  const network = 'testnet' as NetworkType;
   
   // Create provider from window.ethereum
   const provider = useMemo(() => {

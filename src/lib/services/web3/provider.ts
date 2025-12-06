@@ -46,7 +46,7 @@ export async function getBlockNumber(network: NetworkType): Promise<number> {
 export async function getGasPrice(network: NetworkType): Promise<bigint> {
   const provider = getProvider(network);
   const feeData = await provider.getFeeData();
-  return feeData.gasPrice || 5000000000n; // Default 5 Gwei
+  return feeData.gasPrice || BigInt(5000000000); // Default 5 Gwei
 }
 
 /**
@@ -61,7 +61,7 @@ export async function getFeeData(network: NetworkType): Promise<{
   const feeData = await provider.getFeeData();
   
   return {
-    gasPrice: feeData.gasPrice || 5000000000n,
+    gasPrice: feeData.gasPrice || BigInt(5000000000),
     maxFeePerGas: feeData.maxFeePerGas || undefined,
     maxPriorityFeePerGas: feeData.maxPriorityFeePerGas || undefined,
   };

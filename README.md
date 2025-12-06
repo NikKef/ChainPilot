@@ -3,7 +3,7 @@
 ChainPilot is a chat-based Web3 copilot that enables users to interact with the BNB Chain through natural language. Research protocols, generate smart contracts, audit code, and execute on-chain actions — all through conversation.
 
 <p align="center">
-  <img src="assets/ChainPilotLogo-min.png" width="140">
+  <img src="assets/ChainPilotLogo-min.png" width="350">
 </p>
 
 ## Overview

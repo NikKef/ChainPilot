@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { ShieldAlert, Shield, ShieldOff, Check, AlertTriangle } from 'lucide-react';
+import { ShieldAlert, Shield, ShieldOff, Check, AlertTriangle, Loader2 } from 'lucide-react';
 import { Card, Button } from '@/components/ui';
 import type { SecurityLevel } from '@/lib/types';
 import { SECURITY_LEVELS } from '@/lib/types';
@@ -30,7 +30,7 @@ export function SecurityLevelSelector({
   const [pendingLevel, setPendingLevel] = useState<SecurityLevel | null>(null);
 
   const handleSelect = async (level: SecurityLevel) => {
-    if (level === value) return;
+    if (level === value || isChanging) return;
 
     // Show warning when switching to PERMISSIVE
     if (level === 'PERMISSIVE') {
@@ -68,13 +68,19 @@ export function SecurityLevelSelector({
   return (
     <>
       <Card className={className}>
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center justify-between mb-5">
           <div>
             <h3 className="font-semibold">Security Level</h3>
             <p className="text-sm text-foreground-muted">
               Choose how strictly transactions are validated
             </p>
           </div>
+          {isChanging && (
+            <div className="flex items-center gap-2 text-primary text-sm">
+              <Loader2 className="w-4 h-4 animate-spin" />
+              Updating...
+            </div>
+          )}
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
@@ -88,43 +94,46 @@ export function SecurityLevelSelector({
                 key={level}
                 onClick={() => handleSelect(level)}
                 disabled={isChanging}
-                whileHover={{ scale: 1.02 }}
-                whileTap={{ scale: 0.98 }}
+                whileHover={!isChanging ? { scale: 1.02 } : undefined}
+                whileTap={!isChanging ? { scale: 0.98 } : undefined}
                 className={cn(
                   'relative p-4 rounded-xl border-2 text-left transition-all',
                   'focus:outline-none focus:ring-2 focus:ring-primary/50',
                   isSelected
-                    ? 'border-primary bg-primary/10'
-                    : 'border-border bg-background-secondary hover:border-primary/50',
-                  isChanging && 'opacity-50 cursor-not-allowed'
+                    ? 'border-primary bg-primary/5'
+                    : 'border-border bg-background hover:border-primary/40 hover:bg-background-secondary',
+                  isChanging && 'opacity-60 cursor-not-allowed'
                 )}
               >
                 {/* Selected indicator */}
-                {isSelected && (
-                  <motion.div
-                    initial={{ scale: 0 }}
-                    animate={{ scale: 1 }}
-                    className="absolute top-2 right-2 w-5 h-5 rounded-full bg-primary flex items-center justify-center"
-                  >
-                    <Check className="w-3 h-3 text-white" />
-                  </motion.div>
-                )}
+                <AnimatePresence>
+                  {isSelected && (
+                    <motion.div
+                      initial={{ scale: 0 }}
+                      animate={{ scale: 1 }}
+                      exit={{ scale: 0 }}
+                      className="absolute top-3 right-3 w-6 h-6 rounded-full bg-primary flex items-center justify-center shadow-lg shadow-primary/30"
+                    >
+                      <Check className="w-3.5 h-3.5 text-white" />
+                    </motion.div>
+                  )}
+                </AnimatePresence>
 
                 <div className={cn(
-                  'w-10 h-10 rounded-lg flex items-center justify-center mb-3',
-                  level === 'STRICT' && 'bg-accent-red/20',
-                  level === 'NORMAL' && 'bg-accent-amber/20',
-                  level === 'PERMISSIVE' && 'bg-accent-green/20',
+                  'w-12 h-12 rounded-xl flex items-center justify-center mb-3 transition-colors',
+                  level === 'STRICT' && (isSelected ? 'bg-accent-red/20' : 'bg-accent-red/10'),
+                  level === 'NORMAL' && (isSelected ? 'bg-accent-amber/20' : 'bg-accent-amber/10'),
+                  level === 'PERMISSIVE' && (isSelected ? 'bg-accent-green/20' : 'bg-accent-green/10'),
                 )}>
                   <Icon className={cn(
-                    'w-5 h-5',
+                    'w-6 h-6',
                     level === 'STRICT' && 'text-accent-red',
                     level === 'NORMAL' && 'text-accent-amber',
                     level === 'PERMISSIVE' && 'text-accent-green',
                   )} />
                 </div>
 
-                <div className="font-semibold mb-1">{config.label}</div>
+                <div className="font-semibold mb-1.5">{config.label}</div>
                 <div className="text-xs text-foreground-muted leading-relaxed">
                   {config.description}
                 </div>
@@ -134,12 +143,15 @@ export function SecurityLevelSelector({
         </div>
 
         {/* Current level explanation */}
-        <div className={cn(
-          'mt-4 p-4 rounded-xl',
-          value === 'STRICT' && 'bg-accent-red/10 border border-accent-red/20',
-          value === 'NORMAL' && 'bg-accent-amber/10 border border-accent-amber/20',
-          value === 'PERMISSIVE' && 'bg-accent-green/10 border border-accent-green/20',
-        )}>
+        <motion.div 
+          layout
+          className={cn(
+            'mt-5 p-4 rounded-xl transition-colors',
+            value === 'STRICT' && 'bg-accent-red/10 border border-accent-red/20',
+            value === 'NORMAL' && 'bg-accent-amber/10 border border-accent-amber/20',
+            value === 'PERMISSIVE' && 'bg-accent-green/10 border border-accent-green/20',
+          )}
+        >
           <div className="text-sm">
             {value === 'STRICT' && (
               <>
@@ -163,7 +175,7 @@ export function SecurityLevelSelector({
               </>
             )}
           </div>
-        </div>
+        </motion.div>
       </Card>
 
       {/* Permissive mode warning modal */}
@@ -177,18 +189,18 @@ export function SecurityLevelSelector({
             onClick={cancelPermissive}
           >
             <motion.div
-              initial={{ scale: 0.9, opacity: 0 }}
-              animate={{ scale: 1, opacity: 1 }}
-              exit={{ scale: 0.9, opacity: 0 }}
+              initial={{ scale: 0.9, opacity: 0, y: 20 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.9, opacity: 0, y: 20 }}
               onClick={(e) => e.stopPropagation()}
-              className="bg-background-secondary border border-border rounded-2xl p-6 max-w-md w-full"
+              className="bg-background-secondary border border-border rounded-2xl p-6 max-w-md w-full shadow-2xl"
             >
-              <div className="flex items-start gap-4 mb-4">
-                <div className="w-12 h-12 rounded-xl bg-accent-amber/20 flex items-center justify-center flex-shrink-0">
-                  <AlertTriangle className="w-6 h-6 text-accent-amber" />
+              <div className="flex items-start gap-4 mb-5">
+                <div className="w-14 h-14 rounded-xl bg-accent-amber/20 flex items-center justify-center flex-shrink-0">
+                  <AlertTriangle className="w-7 h-7 text-accent-amber" />
                 </div>
                 <div>
-                  <h3 className="text-lg font-bold mb-1">Enable Permissive Mode?</h3>
+                  <h3 className="text-xl font-bold mb-1">Enable Permissive Mode?</h3>
                   <p className="text-sm text-foreground-muted">
                     This will disable most security protections.
                   </p>
@@ -196,21 +208,21 @@ export function SecurityLevelSelector({
               </div>
 
               <div className="bg-accent-amber/10 border border-accent-amber/20 rounded-xl p-4 mb-6">
-                <ul className="text-sm space-y-2">
+                <ul className="text-sm space-y-2.5">
                   <li className="flex items-start gap-2">
-                    <span className="text-accent-amber">•</span>
+                    <span className="text-accent-amber mt-0.5">•</span>
                     <span>Deny lists will be ignored</span>
                   </li>
                   <li className="flex items-start gap-2">
-                    <span className="text-accent-amber">•</span>
+                    <span className="text-accent-amber mt-0.5">•</span>
                     <span>No warnings for risky transactions</span>
                   </li>
                   <li className="flex items-start gap-2">
-                    <span className="text-accent-amber">•</span>
+                    <span className="text-accent-amber mt-0.5">•</span>
                     <span>Unverified contracts will be allowed without warning</span>
                   </li>
                   <li className="flex items-start gap-2">
-                    <span className="text-accent-amber">•</span>
+                    <span className="text-accent-amber mt-0.5">•</span>
                     <span>Only spend caps will be enforced</span>
                   </li>
                 </ul>
@@ -221,6 +233,7 @@ export function SecurityLevelSelector({
                   variant="secondary"
                   onClick={cancelPermissive}
                   className="flex-1"
+                  size="lg"
                 >
                   Cancel
                 </Button>
@@ -229,6 +242,7 @@ export function SecurityLevelSelector({
                   onClick={confirmPermissive}
                   loading={isChanging}
                   className="flex-1"
+                  size="lg"
                 >
                   I Understand, Enable
                 </Button>
@@ -240,4 +254,3 @@ export function SecurityLevelSelector({
     </>
   );
 }
-

@@ -91,6 +91,10 @@ export function useChat({
   const [policyDecision, setPolicyDecision] = useState<PolicyEvaluationResult | null>(null);
   const [currentConversationId, setCurrentConversationId] = useState<string | null>(conversationId || null);
   const [lastUserMessage, setLastUserMessage] = useState<string | undefined>(undefined);
+  const [pendingTransferId, setPendingTransferId] = useState<string | undefined>(undefined);
+  const [pendingSwapId, setPendingSwapId] = useState<string | undefined>(undefined);
+  const [isDirectTransaction, setIsDirectTransaction] = useState<boolean>(false);
+  const [isSwapApproval, setIsSwapApproval] = useState<boolean>(false);
   
   const abortControllerRef = useRef<AbortController | null>(null);
   const loadedConversationRef = useRef<string | null>(null);
@@ -210,9 +214,35 @@ export function useChat({
       if (data.transactionPreview) {
         setPendingTransaction(data.transactionPreview);
         setPolicyDecision(data.policyDecision || null);
+        
+        // Store pending transfer ID if approval is required
+        if (data.approvalRequired?.pendingTransferId) {
+          console.log('[Chat] Storing pendingTransferId:', data.approvalRequired.pendingTransferId);
+          setPendingTransferId(data.approvalRequired.pendingTransferId);
+          setIsDirectTransaction(data.approvalRequired.isDirectTransaction || false);
+          setIsSwapApproval(false);
+          setPendingSwapId(undefined);
+        } 
+        // Store pending swap ID if swap approval is required
+        else if (data.swapApprovalRequired?.pendingSwapId) {
+          console.log('[Chat] Storing pendingSwapId:', data.swapApprovalRequired.pendingSwapId);
+          setPendingSwapId(data.swapApprovalRequired.pendingSwapId);
+          setIsDirectTransaction(data.swapApprovalRequired.isDirectTransaction || false);
+          setIsSwapApproval(true);
+          setPendingTransferId(undefined);
+        } else {
+          setPendingTransferId(undefined);
+          setPendingSwapId(undefined);
+          setIsDirectTransaction(false);
+          setIsSwapApproval(false);
+        }
       } else {
         setPendingTransaction(null);
         setPolicyDecision(null);
+        setPendingTransferId(undefined);
+        setPendingSwapId(undefined);
+        setIsDirectTransaction(false);
+        setIsSwapApproval(false);
       }
 
     } catch (err) {
@@ -380,13 +410,333 @@ export function useChat({
         return;
       }
 
-      // For other transactions (ERC20, swaps, etc.), use Q402 gas sponsorship
+      // Check if this is a direct transaction (approval - user must pay gas)
+      // Handle both transfer approvals and swap approvals
+      if (isDirectTransaction && (pendingTransferId || pendingSwapId)) {
+        const isSwap = isSwapApproval && pendingSwapId;
+        console.log(`[Chat] Direct transaction detected (${isSwap ? 'swap' : 'transfer'} approval) - user pays gas`);
+        
+        setMessages(prev => [...prev, {
+          id: `msg_${Date.now()}_signing`,
+          sessionId,
+          role: 'assistant',
+          content: isSwap
+            ? '🔐 Please **confirm the approval** in your wallet...\n\n⚠️ You will pay gas for this approval (required for PancakeSwap to swap your tokens).\n\n📝 After approval, the swap will proceed automatically (you will also pay gas for the swap).'
+            : '🔐 Please **confirm the approval** in your wallet...\n\n⚠️ You will pay gas for this approval (required for token spending permissions).\n\n📝 After approval, the transfer will be gas-free!',
+          createdAt: new Date().toISOString(),
+        }]);
+
+        // Execute directly from user's wallet
+        const signer = await provider.getSigner();
+        const currentSignerAddress = signerAddress || await signer.getAddress();
+        const tx = await signer.sendTransaction({
+          to: pendingTransaction.preparedTx.to,
+          data: pendingTransaction.preparedTx.data || '0x',
+          value: BigInt(pendingTransaction.preparedTx.value || '0'),
+        });
+        
+        console.log('[Chat] Approval transaction submitted:', tx.hash);
+        
+        // Wait for confirmation
+        const receipt = await tx.wait(1);
+        
+        if (receipt?.status === 1) {
+          // Log successful approval
+          await logTransactionSuccess({
+            sessionId,
+            intentType: 'contract_call',
+            network: pendingTransaction.network,
+            userMessage: lastUserMessage,
+            preview: pendingTransaction,
+            policyDecision,
+            txHash: tx.hash,
+          });
+
+          // Approval succeeded - now automatically prepare the next transaction
+          setMessages(prev => {
+            const filtered = prev.filter(m => !m.content.includes('confirm the approval'));
+            return [...filtered, {
+              id: `msg_${Date.now()}_approval_success`,
+              sessionId,
+              role: 'assistant',
+              content: isSwap
+                ? `✅ Approval confirmed! Transaction: \`${tx.hash.slice(0, 10)}...${tx.hash.slice(-8)}\`\n\n🔐 Now please confirm the **swap** in your wallet...`
+                : `✅ Approval confirmed! Transaction: \`${tx.hash.slice(0, 10)}...${tx.hash.slice(-8)}\`\n\n🔐 Now please sign the **transfer** (gas-free)...`,
+              createdAt: new Date().toISOString(),
+            }];
+          });
+
+          // Reset direct transaction flag
+          setIsDirectTransaction(false);
+          
+          // Handle swap approval follow-up
+          if (isSwap && pendingSwapId) {
+            try {
+              const swapResponse = await fetch('/api/transactions/prepare/pending-swap', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  pendingSwapId,
+                  sessionId,
+                  signerAddress: currentSignerAddress,
+                }),
+              });
+              
+              if (swapResponse.ok) {
+                const swapData = await swapResponse.json();
+                
+                if (swapData.success && swapData.preview?.preparedTx) {
+                  // Execute swap directly from user's wallet
+                  // NOTE: Swaps cannot be gas-sponsored because DEX routers pull tokens from msg.sender
+                  console.log('[Chat] Executing swap directly from user wallet');
+                  
+                  setMessages(prev => {
+                    const filtered = prev.filter(m => !m.content.includes('sign the **swap**'));
+                    return [...filtered, {
+                      id: `msg_${Date.now()}_swap_signing`,
+                      sessionId,
+                      role: 'assistant',
+                      content: '🔐 Please **confirm the swap** in your wallet...\n\n⚠️ You will pay gas for this swap transaction.',
+                      createdAt: new Date().toISOString(),
+                    }];
+                  });
+                  
+                  const swapTx = await signer.sendTransaction({
+                    to: swapData.preview.preparedTx.to,
+                    data: swapData.preview.preparedTx.data || '0x',
+                    value: BigInt(swapData.preview.preparedTx.value || '0'),
+                  });
+                  
+                  console.log('[Chat] Swap transaction submitted:', swapTx.hash);
+                  
+                  const swapReceipt = await swapTx.wait(1);
+                  
+                  if (swapReceipt?.status === 1) {
+                    setMessages(prev => {
+                      const filtered = prev.filter(m => !m.content.includes('confirm the swap'));
+                      return [...filtered, {
+                        id: `msg_${Date.now()}_swap_success`,
+                        sessionId,
+                        role: 'assistant',
+                        content: `✅ Swap executed successfully!\n\n` +
+                          `📊 **Swapped**: ${swapData.swapDetails?.amountIn || ''} ${swapData.swapDetails?.tokenInSymbol || ''} → ${swapData.swapDetails?.amountOut || ''} ${swapData.swapDetails?.tokenOutSymbol || ''}\n\n` +
+                          `Transaction Hash: \`${swapTx.hash}\`\n\n` +
+                          `You can view it on the [block explorer](${pendingTransaction.network === 'mainnet' ? 'https://bscscan.com' : 'https://testnet.bscscan.com'}/tx/${swapTx.hash}).`,
+                        createdAt: new Date().toISOString(),
+                      }];
+                    });
+                    onTransactionSuccess?.(swapTx.hash);
+                  } else {
+                    setMessages(prev => {
+                      const filtered = prev.filter(m => !m.content.includes('confirm the swap'));
+                      return [...filtered, {
+                        id: `msg_${Date.now()}_swap_failed`,
+                        sessionId,
+                        role: 'assistant',
+                        content: '❌ Swap transaction failed on-chain. Please try again.',
+                        createdAt: new Date().toISOString(),
+                      }];
+                    });
+                  }
+                } else {
+                  throw new Error(swapData.error || 'Failed to prepare swap');
+                }
+              } else {
+                setMessages(prev => [...prev, {
+                  id: `msg_${Date.now()}_retry`,
+                  sessionId,
+                  role: 'assistant',
+                  content: `Please send your swap request again (e.g., "Swap ${pendingTransaction.tokenInAmount || ''} ${pendingTransaction.tokenInSymbol || 'tokens'} for ${pendingTransaction.tokenOutSymbol || ''}").`,
+                  createdAt: new Date().toISOString(),
+                }]);
+              }
+            } catch (swapError) {
+              console.error('[Chat] Failed to execute swap:', swapError);
+              const errorMessage = swapError instanceof Error ? swapError.message : 'Unknown error';
+              setMessages(prev => [...prev, {
+                id: `msg_${Date.now()}_swap_error`,
+                sessionId,
+                role: 'assistant',
+                content: `❌ Swap failed: ${errorMessage}\n\nPlease try again.`,
+                createdAt: new Date().toISOString(),
+              }]);
+            }
+          } 
+          // Handle transfer approval follow-up
+          else if (pendingTransferId) {
+            try {
+              const transferResponse = await fetch('/api/transactions/prepare/pending', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  pendingTransferId,
+                  sessionId,
+                  signerAddress: currentSignerAddress,
+                }),
+              });
+              
+              if (transferResponse.ok) {
+                const transferData = await transferResponse.json();
+                
+                if (transferData.success && transferData.typedData) {
+                  // Sign the transfer using Q402
+                  const transferResult = await prepareAndSign(
+                    transferData.preview,
+                    { allowed: true, riskLevel: 'LOW', reasons: [], warnings: [], violations: [] },
+                    sessionId,
+                    provider,
+                    undefined
+                  );
+                  
+                  if (transferResult?.success && transferResult.txHash) {
+                    setMessages(prev => {
+                      const filtered = prev.filter(m => !m.content.includes('sign the **transfer**'));
+                      return [...filtered, {
+                        id: `msg_${Date.now()}_transfer_success`,
+                        sessionId,
+                        role: 'assistant',
+                        content: `✅ Transfer submitted successfully!\n\nTransaction Hash: \`${transferResult.txHash}\`\n\nYou can view it on the [block explorer](${pendingTransaction.network === 'mainnet' ? 'https://bscscan.com' : 'https://testnet.bscscan.com'}/tx/${transferResult.txHash}).`,
+                        createdAt: new Date().toISOString(),
+                      }];
+                    });
+                    onTransactionSuccess?.(transferResult.txHash);
+                  } else {
+                    setMessages(prev => {
+                      const filtered = prev.filter(m => !m.content.includes('sign the **transfer**'));
+                      return [...filtered, {
+                        id: `msg_${Date.now()}_transfer_cancelled`,
+                        sessionId,
+                        role: 'assistant',
+                        content: transferResult?.error 
+                          ? `❌ Transfer failed: ${transferResult.error}`
+                          : 'Transfer was cancelled. You can try again by sending another transfer request.',
+                        createdAt: new Date().toISOString(),
+                      }];
+                    });
+                  }
+                } else {
+                  throw new Error(transferData.error || 'Failed to prepare transfer');
+                }
+              } else {
+                setMessages(prev => [...prev, {
+                  id: `msg_${Date.now()}_retry`,
+                  sessionId,
+                  role: 'assistant',
+                  content: `Please send your transfer request again (e.g., "Send ${pendingTransaction.tokenAmount || ''} ${pendingTransaction.tokenSymbol || 'tokens'} to ...") and it will be **gas-free**!`,
+                  createdAt: new Date().toISOString(),
+                }]);
+              }
+            } catch (transferError) {
+              console.error('[Chat] Failed to auto-continue with transfer:', transferError);
+              setMessages(prev => [...prev, {
+                id: `msg_${Date.now()}_retry`,
+                sessionId,
+                role: 'assistant',
+                content: `Please send your transfer request again (e.g., "Send ${pendingTransaction.tokenAmount || ''} ${pendingTransaction.tokenSymbol || 'tokens'} to ...") and it will be **gas-free**!`,
+                createdAt: new Date().toISOString(),
+              }]);
+            }
+          }
+
+          // Reset all transaction states
+          setPendingTransaction(null);
+          setPolicyDecision(null);
+          setPendingTransferId(undefined);
+          setPendingSwapId(undefined);
+          setIsSwapApproval(false);
+          setIsLoading(false);
+          
+          return;
+        } else {
+          throw new Error('Approval transaction failed on-chain');
+        }
+      }
+
+      // Check if this is a swap that needs direct execution (not via Q402)
+      // Swaps cannot use Q402 because DEX routers pull tokens from msg.sender
+      const isSwapTransaction = pendingTransaction.type === 'swap';
+      if (isSwapTransaction || isDirectTransaction) {
+        console.log('[Chat] Swap/Direct transaction detected - executing directly from user wallet');
+        
+        setMessages(prev => [...prev, {
+          id: `msg_${Date.now()}_signing`,
+          sessionId,
+          role: 'assistant',
+          content: '🔐 Please **confirm the transaction** in your wallet...\n\n⚠️ You will pay gas for this transaction.',
+          createdAt: new Date().toISOString(),
+        }]);
+        
+        const signer = await provider.getSigner();
+        const swapTx = await signer.sendTransaction({
+          to: pendingTransaction.preparedTx.to,
+          data: pendingTransaction.preparedTx.data || '0x',
+          value: BigInt(pendingTransaction.preparedTx.value || '0'),
+        });
+        
+        console.log('[Chat] Direct transaction submitted:', swapTx.hash);
+        
+        const receipt = await swapTx.wait(1);
+        
+        if (receipt?.status === 1) {
+          // Log successful transaction to activity
+          await logTransactionSuccess({
+            sessionId,
+            intentType,
+            network: pendingTransaction.network,
+            userMessage: lastUserMessage,
+            preview: pendingTransaction,
+            policyDecision,
+            txHash: swapTx.hash,
+            estimatedValueUsd: pendingTransaction.valueUsd ? parseFloat(pendingTransaction.valueUsd) : undefined,
+          });
+          
+          setMessages(prev => {
+            const filtered = prev.filter(m => !m.content.includes('confirm the transaction'));
+            return [...filtered, {
+              id: `msg_${Date.now()}_tx`,
+              sessionId,
+              role: 'assistant',
+              content: pendingTransaction.type === 'swap'
+                ? `✅ Swap executed successfully!\n\n📊 **Swapped**: ${pendingTransaction.tokenInAmount || ''} ${pendingTransaction.tokenInSymbol || ''} → ${pendingTransaction.tokenOutAmount || ''} ${pendingTransaction.tokenOutSymbol || ''}\n\nTransaction Hash: \`${swapTx.hash}\`\n\nYou can view it on the [block explorer](${pendingTransaction.network === 'mainnet' ? 'https://bscscan.com' : 'https://testnet.bscscan.com'}/tx/${swapTx.hash}).`
+                : `✅ Transaction confirmed!\n\nTransaction Hash: \`${swapTx.hash}\`\n\nYou can view it on the [block explorer](${pendingTransaction.network === 'mainnet' ? 'https://bscscan.com' : 'https://testnet.bscscan.com'}/tx/${swapTx.hash}).`,
+              createdAt: new Date().toISOString(),
+            }];
+          });
+          onTransactionSuccess?.(swapTx.hash);
+        } else {
+          // Log failed transaction
+          await logTransactionFailure({
+            sessionId,
+            intentType,
+            network: pendingTransaction.network,
+            userMessage: lastUserMessage,
+            preview: pendingTransaction,
+            policyDecision,
+            errorMessage: 'Transaction failed on-chain',
+          });
+          throw new Error('Transaction failed on-chain');
+        }
+        
+        setPendingTransaction(null);
+        setPolicyDecision(null);
+        setPendingTransferId(undefined);
+        setPendingSwapId(undefined);
+        setIsDirectTransaction(false);
+        setIsSwapApproval(false);
+        setIsLoading(false);
+        return;
+      }
+
+      // For other transactions (ERC20 transfers, etc.), use Q402 gas sponsorship
       // Add signing prompt message
+      const isApproval = pendingTransferId !== undefined && !isDirectTransaction;
       setMessages(prev => [...prev, {
         id: `msg_${Date.now()}_signing`,
         sessionId,
         role: 'assistant',
-        content: '🔐 Please sign the transaction in your wallet...\n\n✨ Gas will be sponsored - you only need to sign!',
+        content: isApproval
+          ? '🔐 Please sign the **approval** in your wallet...\n\n✨ Gas will be sponsored - you only need to sign!\n\n📝 After approval, the transfer will be presented for signing automatically.'
+          : '🔐 Please sign the transaction in your wallet...\n\n✨ Gas will be sponsored - you only need to sign!',
         createdAt: new Date().toISOString(),
       }]);
 
@@ -395,14 +745,18 @@ export function useChat({
         policyDecision,
         sessionId,
         providerAvailable: !!provider,
+        pendingTransferId,
       });
 
       // Use Q402 to prepare, sign, and execute (gas sponsored)
+      // If pendingTransferId is present, this is an approval transaction
+      // and the transfer will automatically follow after approval
       const result = await prepareAndSign(
         pendingTransaction,
         policyDecision,
         sessionId,
-        provider
+        provider,
+        isApproval ? pendingTransferId : undefined
       );
       
       console.log('[Chat] prepareAndSign result:', result);
@@ -481,6 +835,10 @@ export function useChat({
 
       setPendingTransaction(null);
       setPolicyDecision(null);
+      setPendingTransferId(undefined);
+      setPendingSwapId(undefined);
+      setIsDirectTransaction(false);
+      setIsSwapApproval(false);
       resetQ402();
 
     } catch (err) {
@@ -528,7 +886,7 @@ export function useChat({
     } finally {
       setIsLoading(false);
     }
-  }, [pendingTransaction, policyDecision, sessionId, provider, signerAddress, lastUserMessage, onError, onTransactionSuccess, prepareAndSign, resetQ402]);
+  }, [pendingTransaction, policyDecision, sessionId, provider, signerAddress, lastUserMessage, pendingTransferId, pendingSwapId, isSwapApproval, isDirectTransaction, onError, onTransactionSuccess, prepareAndSign, resetQ402]);
 
   const rejectTransaction = useCallback(async () => {
     // Log cancelled transaction to activity
@@ -544,6 +902,10 @@ export function useChat({
 
     setPendingTransaction(null);
     setPolicyDecision(null);
+    setPendingTransferId(undefined);
+    setPendingSwapId(undefined);
+    setIsDirectTransaction(false);
+    setIsSwapApproval(false);
 
     setMessages(prev => [...prev, {
       id: `msg_${Date.now()}_reject`,
@@ -558,6 +920,10 @@ export function useChat({
     setMessages([]);
     setPendingTransaction(null);
     setPolicyDecision(null);
+    setPendingTransferId(undefined);
+    setPendingSwapId(undefined);
+    setIsDirectTransaction(false);
+    setIsSwapApproval(false);
     setError(null);
     setCurrentConversationId(null);
     loadedConversationRef.current = null;

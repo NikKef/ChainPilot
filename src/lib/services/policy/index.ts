@@ -219,9 +219,11 @@ export function getDefaultPolicy(sessionId: string): PolicyWithLists {
   return {
     id: '',
     sessionId,
+    securityLevel: 'NORMAL',
     maxPerTxUsd: 1000,
     maxDailyUsd: 5000,
-    allowUnknownContracts: false,
+    requireVerifiedContracts: false,
+    largeTransactionThresholdPct: 30,
     maxSlippageBps: 300,
     allowedTokens: [],
     deniedTokens: [],

@@ -1,4 +1,4 @@
-import { keccak256, toUtf8Bytes, hexlify, randomBytes, TypedDataDomain, TypedDataField, parseEther, parseUnits } from 'ethers';
+import { keccak256, toUtf8Bytes, hexlify, randomBytes, TypedDataDomain, TypedDataField, parseEther, parseUnits, solidityPacked, Contract, JsonRpcProvider } from 'ethers';
 import type { PreparedTx } from '@/lib/types';
 import type {
   Q402PaymentRequest,
@@ -15,7 +15,7 @@ import type {
   FacilitatorVerifyResponse,
   FacilitatorSettleResponse,
 } from './types';
-import { Q402_WITNESS_TYPES } from './types';
+import { Q402_WITNESS_TYPES, Q402_CONTRACT_ABI } from './types';
 import { NETWORKS, Q402_CONTRACTS, Q402_FACILITATOR, type NetworkType } from '@/lib/utils/constants';
 import { logger } from '@/lib/utils';
 import { ExternalApiError } from '@/lib/utils/errors';
@@ -47,12 +47,46 @@ function resolveApiUrl(baseUrl: string): string {
  */
 const GLOBAL_STORE_KEY = '__q402_request_store__';
 
+// Pending transfer info stored when approval is needed
+export interface PendingTransferInfo {
+  approvalRequestId: string;
+  sessionId: string;
+  network: string;
+  walletAddress: string;
+  tokenAddress: string;
+  tokenSymbol: string;
+  recipientAddress: string;
+  amount: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+// Pending swap info stored when approval is needed
+export interface PendingSwapInfo {
+  approvalRequestId: string;
+  sessionId: string;
+  network: string;
+  walletAddress: string;
+  tokenIn: string;
+  tokenInSymbol: string;
+  tokenOut: string | null; // null for native BNB
+  tokenOutSymbol: string;
+  amount: string;
+  slippageBps: number;
+  createdAt: string;
+  expiresAt: string;
+}
+
 // Declare the global type
 declare global {
   // eslint-disable-next-line no-var
   var __q402_request_store__: Map<string, Q402PaymentRequest> | undefined;
   // eslint-disable-next-line no-var
   var __q402_cleanup_initialized__: boolean | undefined;
+  // eslint-disable-next-line no-var
+  var __q402_pending_transfers__: Map<string, PendingTransferInfo> | undefined;
+  // eslint-disable-next-line no-var
+  var __q402_pending_swaps__: Map<string, PendingSwapInfo> | undefined;
 }
 
 // Get or create the global store
@@ -62,6 +96,76 @@ function getGlobalRequestStore(): Map<string, Q402PaymentRequest> {
     console.log('[Q402] Created new global request store');
   }
   return globalThis.__q402_request_store__;
+}
+
+// Get or create the pending transfers store
+function getPendingTransferStore(): Map<string, PendingTransferInfo> {
+  if (!globalThis.__q402_pending_transfers__) {
+    globalThis.__q402_pending_transfers__ = new Map<string, PendingTransferInfo>();
+    console.log('[Q402] Created new pending transfer store');
+  }
+  return globalThis.__q402_pending_transfers__;
+}
+
+// Get or create the pending swaps store
+function getPendingSwapStore(): Map<string, PendingSwapInfo> {
+  if (!globalThis.__q402_pending_swaps__) {
+    globalThis.__q402_pending_swaps__ = new Map<string, PendingSwapInfo>();
+    console.log('[Q402] Created new pending swap store');
+  }
+  return globalThis.__q402_pending_swaps__;
+}
+
+/**
+ * Store a pending transfer (called when approval is needed)
+ */
+export function storePendingTransfer(info: PendingTransferInfo): void {
+  const store = getPendingTransferStore();
+  store.set(info.approvalRequestId, info);
+  console.log('[Q402] Stored pending transfer', { approvalRequestId: info.approvalRequestId });
+}
+
+/**
+ * Get a pending transfer by approval request ID
+ */
+export function getPendingTransfer(approvalRequestId: string): PendingTransferInfo | undefined {
+  const store = getPendingTransferStore();
+  return store.get(approvalRequestId);
+}
+
+/**
+ * Delete a pending transfer after it's been processed
+ */
+export function deletePendingTransfer(approvalRequestId: string): void {
+  const store = getPendingTransferStore();
+  store.delete(approvalRequestId);
+  console.log('[Q402] Deleted pending transfer', { approvalRequestId });
+}
+
+/**
+ * Store a pending swap (called when approval is needed)
+ */
+export function storePendingSwap(info: PendingSwapInfo): void {
+  const store = getPendingSwapStore();
+  store.set(info.approvalRequestId, info);
+  console.log('[Q402] Stored pending swap', { approvalRequestId: info.approvalRequestId });
+}
+
+/**
+ * Get a pending swap by approval request ID
+ */
+export function getPendingSwap(approvalRequestId: string): PendingSwapInfo | undefined {
+  const store = getPendingSwapStore();
+  return store.get(approvalRequestId);
+}
+
+/**
+ * Delete a pending swap after it's been processed
+ */
+export function deletePendingSwap(approvalRequestId: string): void {
+  const store = getPendingSwapStore();
+  store.delete(approvalRequestId);
+  console.log('[Q402] Deleted pending swap', { approvalRequestId });
 }
 
 // Clean up expired requests every 5 minutes (only initialize once)
@@ -113,9 +217,67 @@ export class Q402Client {
   }
 
   /**
-   * Generate a unique payment ID (bytes32)
+   * Get the current nonce for a user from the Q402 implementation contract
    */
-  private generatePaymentId(): string {
+  async getNonce(userAddress: string): Promise<number> {
+    try {
+      const networkConfig = this.config.network === 'bsc-mainnet' 
+        ? NETWORKS.mainnet 
+        : NETWORKS.testnet;
+      
+      const provider = new JsonRpcProvider(networkConfig.rpcUrl);
+      const contract = new Contract(
+        this.config.implementationContract,
+        Q402_CONTRACT_ABI,
+        provider
+      );
+      
+      const nonce = await contract.getNonce(userAddress);
+      const nonceNumber = Number(nonce);
+      
+      logger.q402('Fetched user nonce', { 
+        userAddress, 
+        nonce: nonceNumber,
+        contract: this.config.implementationContract,
+      });
+      
+      return nonceNumber;
+    } catch (error) {
+      logger.error('Failed to fetch nonce from contract', { 
+        userAddress, 
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // Default to 0 if we can't fetch the nonce
+      // This may cause the transaction to fail, but it's better than silently using wrong nonce
+      return 0;
+    }
+  }
+
+  /**
+   * Compute payment ID the same way the contract does
+   * bytes32 paymentId = keccak256(abi.encodePacked(owner, token, recipient, amount, nonce, deadline))
+   */
+  private computePaymentId(
+    owner: string,
+    token: string,
+    recipient: string,
+    amount: string,
+    nonce: number,
+    deadline: number
+  ): string {
+    return keccak256(
+      solidityPacked(
+        ['address', 'address', 'address', 'uint256', 'uint256', 'uint256'],
+        [owner, token, recipient, BigInt(amount), BigInt(nonce), BigInt(deadline)]
+      )
+    );
+  }
+
+  /**
+   * Generate a placeholder payment ID for batch operations
+   * These get replaced with computed paymentIds when the batch is finalized
+   */
+  private generatePlaceholderPaymentId(): string {
     const timestamp = Date.now().toString();
     const random = hexlify(randomBytes(16));
     return keccak256(toUtf8Bytes(`${timestamp}:${random}`));
@@ -145,6 +307,7 @@ export class Q402Client {
       tokenAddress?: string;
       amount?: string;
       nonce?: number;
+      recipientAddress?: string; // Actual recipient for transfers
     }
   ): Promise<Q402PaymentRequest> {
     logger.q402('createPaymentRequest', { action: metadata.action });
@@ -172,17 +335,27 @@ export class Q402Client {
       }
     }
 
+    // For token transfers, use the actual recipient address
+    // For payments to facilitator, use the facilitator address
+    const recipientAddress = options?.recipientAddress || this.config.recipientAddress;
+
     // Create payment details for x402 protocol compliance
     const paymentDetails: Q402PaymentDetails = {
       scheme: 'evm/eip7702-delegated-payment',
       networkId: this.config.network,
       token: options?.tokenAddress || '0x0000000000000000000000000000000000000000', // Native BNB
       amount: amountInWei,
-      to: this.config.recipientAddress,
+      to: recipientAddress,
       implementationContract: this.config.implementationContract,
       verifyingContract: this.config.verifyingContract,
       description: metadata.description,
     };
+    
+    logger.debug('Payment details created', {
+      token: paymentDetails.token,
+      amount: paymentDetails.amount,
+      to: paymentDetails.to,
+    });
 
     const request: Q402PaymentRequest = {
       id: requestId,
@@ -230,13 +403,26 @@ export class Q402Client {
       throw new Error('Payment details not available on request');
     }
 
+    const deadline = request.policy?.deadline || Math.floor(Date.now() / 1000) + 1200; // 20 min default
+    
+    // Compute paymentId the same way the contract does:
+    // keccak256(abi.encodePacked(owner, token, recipient, amount, nonce, deadline))
+    const paymentId = this.computePaymentId(
+      ownerAddress,
+      paymentDetails.token,
+      paymentDetails.to,
+      paymentDetails.amount,
+      nonce,
+      deadline
+    );
+
     const witness: Q402Witness = {
       owner: ownerAddress,
       token: paymentDetails.token,
       amount: paymentDetails.amount,
       to: paymentDetails.to,
-      deadline: request.policy?.deadline || Math.floor(Date.now() / 1000) + 1200, // 20 min default
-      paymentId: this.generatePaymentId(),
+      deadline,
+      paymentId,
       nonce,
     };
     
@@ -472,6 +658,16 @@ export class Q402Client {
       const network = this.config.network === 'bsc-mainnet' ? 'mainnet' : 'testnet';
       const facilitator = await initializeFacilitator(network);
       
+      // Log transaction details before building settle request
+      logger.debug('Building settle request with transaction', {
+        requestId: request.id,
+        hasTransaction: !!request.transaction,
+        transactionTo: request.transaction?.to,
+        transactionDataLength: request.transaction?.data?.length,
+        transactionDataPreview: request.transaction?.data?.slice(0, 74),
+        transactionValue: request.transaction?.value,
+      });
+
       // Build settle request using the STORED witness
       const settleRequest: SettleRequest = {
         networkId: this.config.network,
@@ -479,7 +675,11 @@ export class Q402Client {
         witness: request.witness,  // Use the stored witness!
         signature: executionRequest.signature,
         signerAddress: executionRequest.signerAddress,
-        transaction: request.transaction,
+        transaction: request.transaction ? {
+          to: request.transaction.to,
+          data: request.transaction.data,
+          value: request.transaction.value,
+        } : undefined,
       };
       
       logger.info('Submitting to facilitator service directly', {
@@ -487,10 +687,12 @@ export class Q402Client {
         signerAddress: executionRequest.signerAddress,
         paymentId: request.witness.paymentId,
         network,
+        settleTransactionData: settleRequest.transaction?.data?.slice(0, 74),
       });
       
       // Call the facilitator service directly
-      const result = await facilitator.settle(settleRequest);
+      // Skip verification since we already verified the signature above
+      const result = await facilitator.settle(settleRequest, true);
       
       if (result.success) {
         logger.info('Facilitator settlement successful', {
@@ -521,19 +723,37 @@ export class Q402Client {
     request: Q402PaymentRequest,
     execution: Q402ExecutionRequest
   ): Promise<Q402ExecutionResult> {
-    // Generate a realistic-looking transaction hash
-    const txHash = hexlify(randomBytes(32));
-
-    // Simulate network delay
-    await new Promise(resolve => setTimeout(resolve, 1500));
-
-    return {
-      success: true,
+    // In development mode, we might want to simulate success
+    // But in production, we should fail properly
+    const isDevelopment = process.env.NODE_ENV === 'development';
+    
+    if (isDevelopment && process.env.ENABLE_Q402_SIMULATION === 'true') {
+      // Only simulate if explicitly enabled in development
+      const txHash = hexlify(randomBytes(32));
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      
+      logger.warn('Using SIMULATED transaction (not real)', { requestId: request.id, txHash });
+      
+      return {
+        success: true,
+        requestId: request.id,
+        txHash,
+        blockNumber: Math.floor(Math.random() * 1000000) + 30000000,
+        gasUsed: request.transaction.gasLimit || '100000',
+        status: 'completed',
+      };
+    }
+    
+    // In production or when simulation is disabled, return failure
+    logger.error('Facilitator settlement failed and simulation is disabled', {
       requestId: request.id,
-      txHash,
-      blockNumber: Math.floor(Math.random() * 1000000) + 30000000,
-      gasUsed: request.transaction.gasLimit || '100000',
-      status: 'completed',
+    });
+    
+    return {
+      success: false,
+      requestId: request.id,
+      status: 'failed',
+      error: 'Transaction settlement failed. Please try again.',
     };
   }
 
@@ -592,14 +812,14 @@ export class Q402Client {
     const now = Date.now();
     const deadline = now + Q402_FACILITATOR.requestExpiryMs;
 
-    // Create witnesses for each transaction
+    // Create witnesses for each transaction (placeholders - will be filled by signer)
     const witnesses: Q402Witness[] = transactions.map((tx, index) => ({
       owner: '0x0000000000000000000000000000000000000000', // Will be filled by signer
       token: '0x0000000000000000000000000000000000000000',
       amount: tx.value || '0',
       to: this.config.recipientAddress,
       deadline: Math.floor(deadline / 1000),
-      paymentId: this.generatePaymentId(),
+      paymentId: this.generatePlaceholderPaymentId(), // Placeholder - will be recomputed when finalized
       nonce: index,
     }));
 
@@ -712,7 +932,14 @@ export class Q402Client {
   private async storeRequest(request: Q402PaymentRequest): Promise<void> {
     const store = getGlobalRequestStore();
     store.set(request.id, request);
-    logger.q402('Request stored', { requestId: request.id, storeSize: store.size });
+    logger.q402('Request stored', { 
+      requestId: request.id, 
+      storeSize: store.size,
+      hasTransaction: !!request.transaction,
+      transactionTo: request.transaction?.to,
+      transactionDataLength: request.transaction?.data?.length,
+      transactionDataPreview: request.transaction?.data?.slice(0, 74),
+    });
   }
 
   /**

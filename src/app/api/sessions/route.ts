@@ -138,9 +138,11 @@ export async function POST(request: NextRequest) {
     const policy = policyData ? {
       id: policyData.id,
       sessionId: policyData.session_id,
+      securityLevel: policyData.security_level,
       maxPerTxUsd: policyData.max_per_tx_usd,
       maxDailyUsd: policyData.max_daily_usd,
-      allowUnknownContracts: policyData.allow_unknown_contracts,
+      requireVerifiedContracts: policyData.require_verified_contracts,
+      largeTransactionThresholdPct: policyData.large_transaction_threshold_pct,
       maxSlippageBps: policyData.max_slippage_bps,
       allowedTokens: tokenLists
         .filter(t => t.list_type === 'allowed')
@@ -163,9 +165,11 @@ export async function POST(request: NextRequest) {
       policy: policy || {
         id: '',
         sessionId: session.id,
+        securityLevel: 'NORMAL',
         maxPerTxUsd: 1000,
         maxDailyUsd: 5000,
-        allowUnknownContracts: false,
+        requireVerifiedContracts: false,
+        largeTransactionThresholdPct: 30,
         maxSlippageBps: 300,
         allowedTokens: [],
         deniedTokens: [],

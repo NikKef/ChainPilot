@@ -45,7 +45,7 @@ export async function GET(request: NextRequest) {
         ]);
 
         // Only include tokens with non-zero balance
-        if (balance.balance > 0n) {
+        if (balance.balance > BigInt(0)) {
           tokenBalances.push({
             address: tokenAddress,
             symbol: tokenInfo.symbol,

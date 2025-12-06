@@ -3,7 +3,7 @@
 import { Bot, User, Code, AlertTriangle, CheckCircle, XCircle } from 'lucide-react';
 import { motion } from 'framer-motion';
 import ReactMarkdown from 'react-markdown';
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { Prism as SyntaxHighlighter, SyntaxHighlighterProps } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import type { ChatMessage } from '@/lib/types';
 import { cn } from '@/lib/utils';
@@ -52,18 +52,19 @@ export function MessageBubble({ message }: MessageBubbleProps) {
           <div className="prose prose-invert prose-sm max-w-none">
             <ReactMarkdown
               components={{
-                code({ node, inline, className, children, ...props }) {
+                code({ className, children, ...props }) {
                   const match = /language-(\w+)/.exec(className || '');
                   const language = match ? match[1] : '';
+                  const isInline = !language && !className;
                   
-                  if (!inline && language) {
+                  if (!isInline && language) {
                     return (
                       <div className="relative group my-3">
                         <div className="absolute top-2 right-2 text-xs text-foreground-subtle opacity-0 group-hover:opacity-100 transition-opacity">
                           {language}
                         </div>
                         <SyntaxHighlighter
-                          style={oneDark}
+                          style={oneDark as SyntaxHighlighterProps['style']}
                           language={language}
                           PreTag="div"
                           customStyle={{
@@ -71,7 +72,6 @@ export function MessageBubble({ message }: MessageBubbleProps) {
                             borderRadius: '0.5rem',
                             fontSize: '0.75rem',
                           }}
-                          {...props}
                         >
                           {String(children).replace(/\n$/, '')}
                         </SyntaxHighlighter>

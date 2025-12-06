@@ -218,3 +218,6 @@ export function getSeverityColor(severity: AuditFinding['severity']): string {
   }
 }
 
+// Re-export from policy.ts to maintain backward compatibility
+export { getRiskLevelVariant } from './policy';
+

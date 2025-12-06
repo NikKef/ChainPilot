@@ -64,11 +64,11 @@ export async function GET(request: NextRequest) {
 
     // Apply filters
     if (status && status !== 'all') {
-      query = query.eq('status', status);
+      query = query.eq('status', status as 'pending' | 'approved' | 'rejected' | 'executed' | 'failed' | 'cancelled');
     }
 
     if (intentType) {
-      query = query.eq('intent_type', intentType);
+      query = query.eq('intent_type', intentType as 'research' | 'explain' | 'generate_contract' | 'audit_contract' | 'transfer' | 'swap' | 'contract_call' | 'deploy');
     }
 
     // Sort and paginate

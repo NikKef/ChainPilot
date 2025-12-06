@@ -152,7 +152,7 @@ export function WalletModal({ isOpen, onClose }: WalletModalProps) {
                         <div className="flex-1">
                           <div className="flex items-center gap-2">
                             <span className="font-medium">{getWalletName()}</span>
-                            <Badge variant="success" size="sm">Connected</Badge>
+                            <Badge variant="success">Connected</Badge>
                           </div>
                           <button
                             onClick={handleCopyAddress}
@@ -184,9 +184,9 @@ export function WalletModal({ isOpen, onClose }: WalletModalProps) {
                       <div className="flex items-center justify-between mb-3">
                         <span className="text-sm text-foreground-muted">Network</span>
                         {isCorrectNetwork ? (
-                          <Badge variant="success" size="sm">BNB Chain</Badge>
+                          <Badge variant="success">BNB Chain</Badge>
                         ) : (
-                          <Badge variant="high" size="sm">Wrong Network</Badge>
+                          <Badge variant="high">Wrong Network</Badge>
                         )}
                       </div>
 

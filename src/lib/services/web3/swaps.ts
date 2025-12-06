@@ -68,7 +68,7 @@ export async function getSwapQuote(
 
     // Calculate minimum output with slippage
     const slippageMultiplier = BigInt(10000 - slippageBps);
-    const amountOutMinWei = (amountOutWei * slippageMultiplier) / 10000n;
+    const amountOutMinWei = (amountOutWei * slippageMultiplier) / BigInt(10000);
 
     // Calculate price impact (simplified)
     const priceImpact = calculatePriceImpact(amountInWei, amountOutWei, path.length);
@@ -161,7 +161,7 @@ export async function buildSwapExactTokensForTokens(
     to: routerAddress,
     data,
     value: '0',
-    gasLimit: (gasEstimate * 130n / 100n).toString(),
+    gasLimit: (gasEstimate * BigInt(130) / BigInt(100)).toString(),
     gasPrice: feeData.gasPrice.toString(),
   };
 }
@@ -201,7 +201,7 @@ export async function buildSwapExactETHForTokens(
     to: routerAddress,
     data,
     value: quote.amountIn,
-    gasLimit: (gasEstimate * 130n / 100n).toString(),
+    gasLimit: (gasEstimate * BigInt(130) / BigInt(100)).toString(),
     gasPrice: feeData.gasPrice.toString(),
   };
 }
@@ -242,7 +242,7 @@ export async function buildSwapExactTokensForETH(
     to: routerAddress,
     data,
     value: '0',
-    gasLimit: (gasEstimate * 130n / 100n).toString(),
+    gasLimit: (gasEstimate * BigInt(130) / BigInt(100)).toString(),
     gasPrice: feeData.gasPrice.toString(),
   };
 }
@@ -290,15 +290,9 @@ export async function buildSwap(
     const allowance = await getAllowance(tokenIn!, from, routerAddress, network);
     if (allowance < BigInt(quote.amountIn)) {
       needsApproval = true;
-      // Build max approval
-      const { buildApproval } = await import('./transactions');
-      approvalTx = await buildApproval(
-        from,
-        tokenIn!,
-        routerAddress,
-        '115792089237316195423570985008687907853269984665640564039457584007913129639935', // Max uint256
-        network
-      );
+      // Build max approval using buildSwapApproval (handles max uint256 correctly)
+      const { buildSwapApproval } = await import('./transactions');
+      approvalTx = await buildSwapApproval(from, tokenIn!, network);
     }
   } else {
     // Token -> Token
@@ -309,14 +303,9 @@ export async function buildSwap(
     const allowance = await getAllowance(tokenIn!, from, routerAddress, network);
     if (allowance < BigInt(quote.amountIn)) {
       needsApproval = true;
-      const { buildApproval } = await import('./transactions');
-      approvalTx = await buildApproval(
-        from,
-        tokenIn!,
-        routerAddress,
-        '115792089237316195423570985008687907853269984665640564039457584007913129639935',
-        network
-      );
+      // Build max approval using buildSwapApproval (handles max uint256 correctly)
+      const { buildSwapApproval } = await import('./transactions');
+      approvalTx = await buildSwapApproval(from, tokenIn!, network);
     }
   }
 

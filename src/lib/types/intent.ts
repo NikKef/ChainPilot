@@ -181,7 +181,7 @@ export function isIntentComplete(intent: Intent): boolean {
   }
 
   return requiredFields.every((field) => {
-    const value = (intent as Record<string, unknown>)[field];
+    const value = (intent as unknown as Record<string, unknown>)[field];
     return value !== undefined && value !== null && value !== '';
   });
 }
@@ -202,7 +202,7 @@ export function getMissingFields(intent: Intent): string[] {
   }
 
   return requiredFields.filter((field) => {
-    const value = (intent as Record<string, unknown>)[field];
+    const value = (intent as unknown as Record<string, unknown>)[field];
     return value === undefined || value === null || value === '';
   });
 }

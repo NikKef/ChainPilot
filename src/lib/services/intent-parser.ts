@@ -178,11 +178,31 @@ export class IntentParser {
     missingField: string,
     question: string
   ) {
+    // Check if token exists on mainnet but not testnet
+    const upperSymbol = symbol.toUpperCase();
+    const mapping = TOKEN_SYMBOLS[upperSymbol];
+    const network = this.sessionContext.network;
+    
+    let customQuestion = question;
+    
+    if (mapping) {
+      // Token is known but not available on current network
+      if (network === 'testnet' && mapping.mainnet && !mapping.testnet) {
+        customQuestion = `${symbol} is available on mainnet but not on testnet. If you have a testnet version of this token, please provide its contract address.`;
+      } else if (network === 'mainnet' && mapping.testnet && !mapping.mainnet) {
+        customQuestion = `${symbol} is available on testnet but not on mainnet. Please provide the contract address if you have one.`;
+      }
+    }
+    
     if (!result.missingFields.includes(missingField)) {
       result.missingFields.push(missingField);
     }
-    if (!result.questions.includes(question)) {
-      result.questions.push(question);
+    // Replace the generic question with our custom one
+    const existingQuestionIndex = result.questions.findIndex(q => q.includes(symbol));
+    if (existingQuestionIndex >= 0) {
+      result.questions[existingQuestionIndex] = customQuestion;
+    } else if (!result.questions.includes(customQuestion)) {
+      result.questions.push(customQuestion);
     }
     result.requiresFollowUp = true;
     logger.warn('Unknown token symbol', { symbol, network: this.sessionContext.network });

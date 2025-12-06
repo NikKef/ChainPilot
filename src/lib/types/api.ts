@@ -32,6 +32,34 @@ export interface ChatResponse {
   transactionPreview?: TransactionPreview;
   policyDecision?: PolicyEvaluationResult;
   
+  // For token transfers requiring approval
+  approvalRequired?: {
+    tokenAddress: string;
+    tokenSymbol: string;
+    spenderAddress: string;
+    amount: string;
+    currentAllowance: string;
+    requiredAmount: string;
+    pendingTransferId?: string; // ID to retrieve pending transfer after approval
+    isDirectTransaction?: boolean; // If true, user must send this directly (pays gas) - approvals cannot be gas-sponsored
+  };
+  
+  // For swaps requiring approval (token -> token or token -> BNB)
+  swapApprovalRequired?: {
+    tokenInAddress: string;
+    tokenInSymbol: string;
+    tokenOutAddress: string | null; // null for native BNB
+    tokenOutSymbol: string;
+    routerAddress: string;
+    amount: string;
+    currentAllowance: string;
+    requiredAmount: string;
+    pendingSwapId?: string; // ID to retrieve pending swap after approval
+    isDirectTransaction?: boolean; // If true, user must send this directly (pays gas)
+    slippageBps: number;
+    estimatedOutput?: string;
+  };
+  
   // For contract operations
   generatedContract?: GeneratedContract;
   auditResult?: AuditResult;
@@ -123,6 +151,7 @@ export interface ExecuteTransactionRequest {
   signature: string;           // EIP-712 witness signature (required for Q402)
   signerAddress: string;       // User's wallet address
   network?: NetworkType;       // Network for execution
+  pendingTransferId?: string;  // ID of pending transfer to execute after approval
   authorization?: {            // Optional EIP-7702 authorization
     chainId: number;
     address: string;
@@ -142,6 +171,16 @@ export interface ExecuteTransactionResponse {
   actionLog?: ActionLog;
   explorerUrl?: string;        // Direct link to block explorer
   error?: string;
+  
+  // For multi-step transactions (e.g., approval + transfer)
+  // If present, the frontend should automatically prompt user to sign this next
+  nextTransaction?: {
+    message: string;           // Message to show user
+    requestId: string;         // Q402 request ID for the next transaction
+    typedData: unknown;        // EIP-712 typed data to sign
+    preview: TransactionPreview;
+    expiresAt: string;
+  };
 }
 
 /**
@@ -294,6 +333,7 @@ export interface CreateSessionResponse {
     walletAddress: string;
     currentNetwork: NetworkType;
     createdAt: string;
+    updatedAt: string;
   };
   policy: PolicyWithLists;
 }

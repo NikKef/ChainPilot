@@ -60,6 +60,7 @@ export async function POST(request: NextRequest) {
     };
 
     // Prepare for Q402 execution
+    // For transfers, body.preview.to is the actual recipient address
     const preparation = await executor.prepareForExecution(
       body.preview.preparedTx,
       body.preview.type,
@@ -70,6 +71,7 @@ export async function POST(request: NextRequest) {
         ownerAddress: body.signerAddress,
         tokenAddress: body.preview.tokenAddress,
         amount: body.preview.tokenAmount || body.preview.nativeValue,
+        recipientAddress: body.preview.to, // The actual recipient of the transfer
       }
     );
 

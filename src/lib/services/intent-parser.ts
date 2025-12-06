@@ -63,46 +63,58 @@ export class IntentParser {
   private postProcess(result: ContextExtractionResult): ContextExtractionResult {
     const { intent } = result;
 
-    // Resolve token symbols to addresses
+    // Resolve token symbols to addresses ONLY if address is not already set
     if ('tokenSymbol' in intent && intent.tokenSymbol) {
-      const resolved = this.resolveTokenSymbol(intent.tokenSymbol);
-      if (resolved) {
-        (intent as TransferIntent).tokenAddress = resolved;
-      } else if (intent.tokenSymbol.toUpperCase() !== 'BNB') {
-        this.markUnknownToken(
-          intent.tokenSymbol,
-          result,
-          'tokenAddress',
-          `I couldn't find ${intent.tokenSymbol} on ${this.sessionContext.network}. Please provide the contract address.`
-        );
+      const transferIntent = intent as TransferIntent;
+      // Skip resolution if tokenAddress is already provided (e.g., from follow-up)
+      if (!transferIntent.tokenAddress) {
+        const resolved = this.resolveTokenSymbol(intent.tokenSymbol);
+        if (resolved) {
+          transferIntent.tokenAddress = resolved;
+        } else if (intent.tokenSymbol.toUpperCase() !== 'BNB') {
+          this.markUnknownToken(
+            intent.tokenSymbol,
+            result,
+            'tokenAddress',
+            `I couldn't find ${intent.tokenSymbol} on ${this.sessionContext.network}. Please provide the contract address.`
+          );
+        }
       }
     }
 
     if ('tokenInSymbol' in intent && intent.tokenInSymbol) {
-      const resolved = this.resolveTokenSymbol(intent.tokenInSymbol);
-      if (resolved) {
-        (intent as SwapIntent).tokenIn = resolved;
-      } else if (intent.tokenInSymbol.toUpperCase() !== 'BNB') {
-        this.markUnknownToken(
-          intent.tokenInSymbol,
-          result,
-          'tokenIn',
-          `I couldn't find ${intent.tokenInSymbol} on ${this.sessionContext.network}. Please provide the token address for the token you're swapping from.`
-        );
+      const swapIntent = intent as SwapIntent;
+      // Skip resolution if tokenIn is already provided
+      if (!swapIntent.tokenIn) {
+        const resolved = this.resolveTokenSymbol(intent.tokenInSymbol);
+        if (resolved) {
+          swapIntent.tokenIn = resolved;
+        } else if (intent.tokenInSymbol.toUpperCase() !== 'BNB') {
+          this.markUnknownToken(
+            intent.tokenInSymbol,
+            result,
+            'tokenIn',
+            `I couldn't find ${intent.tokenInSymbol} on ${this.sessionContext.network}. Please provide the token address for the token you're swapping from.`
+          );
+        }
       }
     }
 
     if ('tokenOutSymbol' in intent && intent.tokenOutSymbol) {
-      const resolved = this.resolveTokenSymbol(intent.tokenOutSymbol);
-      if (resolved) {
-        (intent as SwapIntent).tokenOut = resolved;
-      } else if (intent.tokenOutSymbol.toUpperCase() !== 'BNB') {
-        this.markUnknownToken(
-          intent.tokenOutSymbol,
-          result,
-          'tokenOut',
-          `I couldn't find ${intent.tokenOutSymbol} on ${this.sessionContext.network}. Please provide the token address for the token you're swapping to.`
-        );
+      const swapIntent = intent as SwapIntent;
+      // Skip resolution if tokenOut is already provided
+      if (!swapIntent.tokenOut) {
+        const resolved = this.resolveTokenSymbol(intent.tokenOutSymbol);
+        if (resolved) {
+          swapIntent.tokenOut = resolved;
+        } else if (intent.tokenOutSymbol.toUpperCase() !== 'BNB') {
+          this.markUnknownToken(
+            intent.tokenOutSymbol,
+            result,
+            'tokenOut',
+            `I couldn't find ${intent.tokenOutSymbol} on ${this.sessionContext.network}. Please provide the token address for the token you're swapping to.`
+          );
+        }
       }
     }
 
@@ -215,11 +227,18 @@ export class IntentParser {
 
     // Add context about what we're expecting
     const partialIntent = this.sessionContext.partialIntent;
+    
+    logger.debug('Processing follow-up with partial intent', { 
+      partialIntentType: partialIntent.type,
+      message: message.slice(0, 100)
+    });
 
     // Try to extract just the missing field from the follow-up
     const extractedValue = this.extractFollowUpValue(message, partialIntent);
 
     if (extractedValue) {
+      logger.debug('Extracted follow-up value', { extractedValue });
+      
       // Merge with partial intent
       const mergedIntent = {
         ...partialIntent,
@@ -227,8 +246,8 @@ export class IntentParser {
         network: this.sessionContext.network,
       } as Intent;
 
-      // Validate completeness
-      const missingFields = this.checkMissingFields(mergedIntent);
+      // Check completeness AFTER merge, considering the new tokenAddress
+      const missingFields = this.checkMissingFieldsExtended(mergedIntent);
 
       const result: ContextExtractionResult = {
         intent: mergedIntent,
@@ -240,8 +259,73 @@ export class IntentParser {
         confidence: 0.9,
       };
 
-      // Post-process
-      return this.postProcess(result);
+      // Post-process (this will now skip symbol resolution since address is set)
+      const processed = this.postProcess(result);
+      
+      // Update context
+      this.updateContext(processed);
+      
+      return processed;
+    }
+
+    // Couldn't extract simple value, but check if message looks like it's providing missing info
+    // If the message is just an address and we need an address, extract it directly
+    const addressMatch = message.trim().match(/^(0x[a-fA-F0-9]{40})$/);
+    if (addressMatch) {
+      logger.debug('Follow-up appears to be just an address', { address: addressMatch[1] });
+      
+      // Determine which field needs this address based on missing fields
+      let fieldToFill: Partial<Intent> | null = null;
+      
+      if (partialIntent.type === 'transfer') {
+        const t = partialIntent as Partial<TransferIntent>;
+        if (!t.tokenAddress && t.tokenSymbol) {
+          // User is providing token address for unknown token
+          fieldToFill = { tokenAddress: addressMatch[1] };
+        } else if (!t.to) {
+          fieldToFill = { to: addressMatch[1] };
+        }
+      } else if (partialIntent.type === 'swap') {
+        const s = partialIntent as Partial<SwapIntent>;
+        if (s.tokenInSymbol && !s.tokenIn) {
+          fieldToFill = { tokenIn: addressMatch[1] };
+        } else if (s.tokenOutSymbol && !s.tokenOut) {
+          fieldToFill = { tokenOut: addressMatch[1] };
+        }
+      } else if (partialIntent.type === 'contract_call') {
+        const c = partialIntent as Partial<ContractCallIntent>;
+        if (!c.contractAddress) {
+          fieldToFill = { contractAddress: addressMatch[1] };
+        }
+      } else if (partialIntent.type === 'audit_contract') {
+        if (!('address' in partialIntent)) {
+          fieldToFill = { address: addressMatch[1] };
+        }
+      }
+      
+      if (fieldToFill) {
+        const mergedIntent = {
+          ...partialIntent,
+          ...fieldToFill,
+          network: this.sessionContext.network,
+        } as Intent;
+        
+        const missingFields = this.checkMissingFieldsExtended(mergedIntent);
+        
+        const result: ContextExtractionResult = {
+          intent: mergedIntent,
+          missingFields,
+          questions: missingFields.length > 0 
+            ? this.generateQuestions(mergedIntent.type, missingFields)
+            : [],
+          requiresFollowUp: missingFields.length > 0,
+          confidence: 0.95,
+        };
+        
+        const processed = this.postProcess(result);
+        this.updateContext(processed);
+        return processed;
+      }
     }
 
     // Couldn't extract value, parse as new message with context
@@ -257,32 +341,62 @@ export class IntentParser {
   ): Partial<Intent> | null {
     const trimmed = message.trim();
 
-    // Check for address
+    // Check for address - this is the primary extraction for follow-ups
     const addressMatch = trimmed.match(/(0x[a-fA-F0-9]{40})/);
     if (addressMatch) {
       const address = addressMatch[1];
       
-      // Determine which field needs this address
+      // Determine which field needs this address based on intent type and what's missing
       if (partialIntent.type === 'transfer') {
-        if (!('to' in partialIntent && partialIntent.to)) {
+        const transferIntent = partialIntent as Partial<TransferIntent>;
+        
+        // Priority 1: If we have a tokenSymbol that couldn't be resolved, this is likely the token address
+        if (transferIntent.tokenSymbol && transferIntent.tokenSymbol.toUpperCase() !== 'BNB') {
+          const resolved = this.resolveTokenSymbol(transferIntent.tokenSymbol);
+          if (!resolved && !transferIntent.tokenAddress) {
+            logger.debug('Matched address to missing tokenAddress for unresolved symbol', { 
+              symbol: transferIntent.tokenSymbol, 
+              address 
+            });
+            return { tokenAddress: address };
+          }
+        }
+        
+        // Priority 2: If 'to' is missing, this could be the recipient
+        if (!transferIntent.to) {
           return { to: address };
         }
-        if (!('tokenAddress' in partialIntent && (partialIntent as Partial<TransferIntent>).tokenAddress)) {
+        
+        // Priority 3: If tokenAddress is explicitly missing
+        if (!transferIntent.tokenAddress) {
           return { tokenAddress: address };
         }
       }
+      
       if (partialIntent.type === 'swap') {
         const swapIntent = partialIntent as Partial<SwapIntent>;
-        if (swapIntent.tokenInSymbol && !swapIntent.tokenIn) {
-          return { tokenIn: address };
+        
+        // Check if tokenIn needs to be resolved
+        if (swapIntent.tokenInSymbol && swapIntent.tokenInSymbol.toUpperCase() !== 'BNB') {
+          const resolved = this.resolveTokenSymbol(swapIntent.tokenInSymbol);
+          if (!resolved && !swapIntent.tokenIn) {
+            return { tokenIn: address };
+          }
         }
-        if (swapIntent.tokenOutSymbol && !swapIntent.tokenOut) {
-          return { tokenOut: address };
+        
+        // Check if tokenOut needs to be resolved
+        if (swapIntent.tokenOutSymbol && swapIntent.tokenOutSymbol.toUpperCase() !== 'BNB') {
+          const resolved = this.resolveTokenSymbol(swapIntent.tokenOutSymbol);
+          if (!resolved && !swapIntent.tokenOut) {
+            return { tokenOut: address };
+          }
         }
       }
+      
       if (partialIntent.type === 'contract_call' && !('contractAddress' in partialIntent && partialIntent.contractAddress)) {
         return { contractAddress: address };
       }
+      
       if (partialIntent.type === 'audit_contract' && !('address' in partialIntent && partialIntent.address)) {
         return { address };
       }
@@ -343,6 +457,72 @@ export class IntentParser {
         const s = intent as SwapIntent;
         if (!s.tokenIn && !s.tokenInSymbol) missing.push('tokenIn');
         if (!s.tokenOut && !s.tokenOutSymbol) missing.push('tokenOut');
+        if (!s.amount) missing.push('amount');
+        break;
+      }
+      case 'contract_call': {
+        const c = intent as ContractCallIntent;
+        if (!c.contractAddress) missing.push('contractAddress');
+        if (!c.method) missing.push('method');
+        break;
+      }
+      case 'audit_contract': {
+        if (!('address' in intent) && !('sourceCode' in intent)) {
+          missing.push('address');
+        }
+        break;
+      }
+    }
+
+    return missing;
+  }
+
+  /**
+   * Extended check for missing fields that includes tokenAddress validation
+   * This accounts for tokens that couldn't be resolved from symbol
+   */
+  private checkMissingFieldsExtended(intent: Intent): string[] {
+    const missing: string[] = [];
+
+    switch (intent.type) {
+      case 'transfer': {
+        const t = intent as TransferIntent;
+        if (!t.to) missing.push('to');
+        if (!t.amount) missing.push('amount');
+        // Check if we have a symbol but no resolved address (and it's not native BNB)
+        if (t.tokenSymbol && t.tokenSymbol.toUpperCase() !== 'BNB' && !t.tokenAddress) {
+          // Only mark as missing if we can't resolve the symbol
+          const resolved = this.resolveTokenSymbol(t.tokenSymbol);
+          if (!resolved) {
+            missing.push('tokenAddress');
+          }
+        }
+        break;
+      }
+      case 'swap': {
+        const s = intent as SwapIntent;
+        // Check tokenIn
+        if (!s.tokenIn) {
+          if (!s.tokenInSymbol) {
+            missing.push('tokenIn');
+          } else if (s.tokenInSymbol.toUpperCase() !== 'BNB') {
+            const resolved = this.resolveTokenSymbol(s.tokenInSymbol);
+            if (!resolved) {
+              missing.push('tokenIn');
+            }
+          }
+        }
+        // Check tokenOut
+        if (!s.tokenOut) {
+          if (!s.tokenOutSymbol) {
+            missing.push('tokenOut');
+          } else if (s.tokenOutSymbol.toUpperCase() !== 'BNB') {
+            const resolved = this.resolveTokenSymbol(s.tokenOutSymbol);
+            if (!resolved) {
+              missing.push('tokenOut');
+            }
+          }
+        }
         if (!s.amount) missing.push('amount');
         break;
       }

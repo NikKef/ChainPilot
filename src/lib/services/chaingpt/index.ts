@@ -3,6 +3,7 @@ import type {
   Intent, 
   ContextExtractionResult, 
   SessionContext,
+  TransferIntent,
 } from '@/lib/types';
 import { logger } from '@/lib/utils';
 import { ExternalApiError } from '@/lib/utils/errors';
@@ -268,8 +269,48 @@ function normalizeIntent(
 
 /**
  * Merge partial intent with new intent
+ * Handles the case where ChainGPT might misclassify a follow-up message
  */
 function mergeIntents(partial: Partial<Intent>, newIntent: Intent): Intent {
+  // Define action intents that should be preserved over research/explain
+  const actionIntents = ['transfer', 'swap', 'contract_call', 'deploy', 'audit_contract', 'generate_contract'];
+  const infoIntents = ['research', 'explain'];
+  
+  // If partial is an action intent and new is just info (explain/research),
+  // the user likely provided info for the action - keep the partial type
+  if (partial.type && actionIntents.includes(partial.type) && infoIntents.includes(newIntent.type)) {
+    logger.debug('Preserving partial action intent over info intent', {
+      partialType: partial.type,
+      newType: newIntent.type
+    });
+    
+    // Extract any useful values from the new intent (like addresses)
+    const newValues: Partial<Intent> = {};
+    
+    // If new intent has an address, use it to fill missing fields in partial
+    if ('address' in newIntent && newIntent.address) {
+      if (partial.type === 'transfer') {
+        const t = partial as Partial<TransferIntent>;
+        // If we have an unresolved token symbol, the address is likely the token address
+        if (t.tokenSymbol && !t.tokenAddress) {
+          newValues.tokenAddress = newIntent.address;
+        } else if (!t.to) {
+          newValues.to = newIntent.address;
+        }
+      } else if (partial.type === 'contract_call' && !('contractAddress' in partial)) {
+        newValues.contractAddress = newIntent.address;
+      } else if (partial.type === 'audit_contract' && !('address' in partial)) {
+        newValues.address = newIntent.address;
+      }
+    }
+    
+    return {
+      ...partial,
+      ...newValues,
+      network: newIntent.network || partial.network,
+    } as Intent;
+  }
+  
   // Only merge if same type
   if (partial.type && partial.type !== newIntent.type) {
     return newIntent;

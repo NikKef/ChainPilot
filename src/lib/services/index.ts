@@ -13,3 +13,6 @@ export * from './q402';
 // Policy services
 export * from './policy';
 
+// Activity logging services
+export * from './activity';
+

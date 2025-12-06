@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createQ402Service, createTransactionExecutor } from '@/lib/services/q402';
+import { createServerActivityLog, getSessionInfo } from '@/lib/services/activity/server';
 import type { ExecuteTransactionRequest, ExecuteTransactionResponse, ActionLog } from '@/lib/types';
 import { formatErrorResponse, getErrorStatusCode, ValidationError } from '@/lib/utils/errors';
 import { logger } from '@/lib/utils';
@@ -12,7 +13,8 @@ import { type NetworkType, NETWORKS } from '@/lib/utils/constants';
  * This endpoint handles the final step of the sign-to-pay flow:
  * 1. Validates the signature
  * 2. Submits to Q402 facilitator for gas-sponsored execution
- * 3. Returns the transaction hash and execution result
+ * 3. Logs the activity to the database
+ * 4. Returns the transaction hash and execution result
  */
 export async function POST(request: NextRequest) {
   const startTime = Date.now();
@@ -43,8 +45,9 @@ export async function POST(request: NextRequest) {
       signerAddress: body.signerAddress,
     });
 
-    // Determine network from session or default to testnet
-    const network: NetworkType = (body.network as NetworkType) || 'testnet';
+    // Get session info to determine network
+    const sessionInfo = await getSessionInfo(body.sessionId);
+    const network: NetworkType = (body.network as NetworkType) || sessionInfo?.network || 'testnet';
     
     // Create Q402 service for the network
     const q402Service = createQ402Service(network);
@@ -60,8 +63,19 @@ export async function POST(request: NextRequest) {
       body.signerAddress
     );
 
-    // Create action log entry
-    const actionLog: ActionLog = {
+    // Log the activity to the database
+    const activityLog = await createServerActivityLog({
+      sessionId: body.sessionId,
+      intentType: 'transfer', // Default to transfer, ideally this would be passed from the client
+      network,
+      txHash: result.txHash,
+      q402RequestId: result.q402RequestId,
+      status: result.success ? 'executed' : 'failed',
+      errorMessage: result.error,
+    });
+
+    // Create action log entry for response
+    const actionLog: ActionLog = activityLog || {
       id: body.actionLogId,
       sessionId: body.sessionId,
       intentType: 'transfer', // Would be determined from original request

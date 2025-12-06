@@ -106,12 +106,12 @@ export function WalletModal({ isOpen, onClose }: WalletModalProps) {
 
           {/* Modal */}
           <motion.div
-            initial={{ opacity: 0, scale: 0.95, y: 20 }}
+            initial={{ opacity: 0, scale: 0.95, y: -20 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.95, y: 20 }}
-            className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-full max-w-md"
+            exit={{ opacity: 0, scale: 0.95, y: -20 }}
+            className="fixed inset-0 z-50 flex items-center justify-center p-4 pointer-events-none"
           >
-            <div className="bg-background-secondary border border-border rounded-2xl shadow-2xl overflow-hidden">
+            <div className="bg-background-secondary border border-border rounded-2xl shadow-2xl overflow-hidden w-full max-w-md pointer-events-auto max-h-[90vh] overflow-y-auto">
               {/* Header */}
               <div className="flex items-center justify-between p-4 border-b border-border">
                 <h2 className="text-lg font-semibold flex items-center gap-2">

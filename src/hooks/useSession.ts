@@ -1,7 +1,8 @@
 'use client';
 
-import { useState, useEffect, useCallback, useRef } from 'react';
-import type { PolicyWithLists, NetworkType } from '@/lib/types';
+import { useState, useCallback, useRef } from 'react';
+import type { PolicyWithLists } from '@/lib/types';
+import type { NetworkType } from '@/lib/utils/constants';
 
 interface Session {
   id: string;
@@ -18,6 +19,21 @@ interface UseSessionReturn {
   createSession: (walletAddress: string, network: NetworkType) => Promise<void>;
   updateNetwork: (network: NetworkType) => Promise<void>;
   updatePolicy: (updates: Partial<PolicyWithLists>) => Promise<void>;
+  clearSession: () => void;
+}
+
+/**
+ * Get the localStorage key for a specific wallet address
+ */
+function getSessionStorageKey(walletAddress: string): string {
+  return `chainpilot_session_${walletAddress.toLowerCase()}`;
+}
+
+/**
+ * Get the localStorage key for active conversation for a specific wallet
+ */
+export function getConversationStorageKey(walletAddress: string): string {
+  return `chainpilot_conversation_${walletAddress.toLowerCase()}`;
 }
 
 export function useSession(): UseSessionReturn {
@@ -26,64 +42,101 @@ export function useSession(): UseSessionReturn {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   
-  // Ref to prevent duplicate restore attempts
-  const isRestoring = useRef(false);
-  const hasRestored = useRef(false);
+  // Track the current wallet to detect changes
+  const currentWalletRef = useRef<string | null>(null);
 
-  // Try to restore session from localStorage on mount
-  useEffect(() => {
-    // Prevent duplicate restore attempts (React Strict Mode, fast refresh, etc.)
-    if (isRestoring.current || hasRestored.current) {
-      return;
-    }
+  /**
+   * Clear all session state
+   * Called when wallet disconnects or changes
+   */
+  const clearSession = useCallback(() => {
+    setSession(null);
+    setPolicy(null);
+    setError(null);
+    currentWalletRef.current = null;
+  }, []);
+
+  /**
+   * Restore session for a specific wallet from localStorage
+   */
+  const restoreSessionForWallet = useCallback(async (walletAddress: string, network: NetworkType): Promise<boolean> => {
+    const normalizedAddress = walletAddress.toLowerCase();
+    const storageKey = getSessionStorageKey(normalizedAddress);
+    const storedSessionId = localStorage.getItem(storageKey);
     
-    const storedSessionId = localStorage.getItem('chainpilot_session_id');
     if (!storedSessionId) {
-      hasRestored.current = true;
-      return;
+      return false;
     }
-    
-    isRestoring.current = true;
-    
-    // Fetch session data
-    fetch(`/api/sessions?sessionId=${storedSessionId}`)
-      .then(res => {
-        // If session not found (404), clear localStorage and don't try again
-        if (res.status === 404) {
-          localStorage.removeItem('chainpilot_session_id');
-          return null;
+
+    try {
+      // Fetch session and verify it belongs to this wallet
+      const sessionRes = await fetch(`/api/sessions?sessionId=${storedSessionId}`);
+      
+      if (sessionRes.status === 404) {
+        // Session no longer exists, clear it
+        localStorage.removeItem(storageKey);
+        return false;
+      }
+
+      const sessionData = await sessionRes.json();
+      
+      // Verify the session belongs to this wallet
+      if (sessionData?.session?.walletAddress?.toLowerCase() !== normalizedAddress) {
+        // Session doesn't belong to this wallet, clear it
+        localStorage.removeItem(storageKey);
+        return false;
+      }
+
+      // Check if network matches, if not we'll need to create/get new session
+      if (sessionData.session.currentNetwork !== network) {
+        // Network mismatch - don't restore, let createSession handle it
+        return false;
+      }
+
+      // Session is valid and belongs to this wallet
+      setSession(sessionData.session);
+
+      // Fetch policy for this session
+      const policyRes = await fetch(`/api/policies?sessionId=${storedSessionId}`);
+      if (policyRes.ok) {
+        const policyData = await policyRes.json();
+        if (policyData?.policy) {
+          setPolicy(policyData.policy);
         }
-        return res.json();
-      })
-      .then(data => {
-        if (data?.session) {
-          setSession(data.session);
-          // Also fetch policy
-          return fetch(`/api/policies?sessionId=${storedSessionId}`);
-        }
-        return null;
-      })
-      .then(res => res?.json())
-      .then(data => {
-        if (data?.policy) {
-          setPolicy(data.policy);
-        }
-      })
-      .catch(() => {
-        // On any error, clear the stale session ID
-        localStorage.removeItem('chainpilot_session_id');
-      })
-      .finally(() => {
-        isRestoring.current = false;
-        hasRestored.current = true;
-      });
+      }
+
+      return true;
+    } catch (error) {
+      console.error('Error restoring session:', error);
+      localStorage.removeItem(storageKey);
+      return false;
+    }
   }, []);
 
   const createSession = useCallback(async (walletAddress: string, network: NetworkType) => {
+    const normalizedAddress = walletAddress.toLowerCase();
+    
+    // Check if this is a different wallet than before
+    if (currentWalletRef.current && currentWalletRef.current !== normalizedAddress) {
+      // Wallet changed, clear old session first
+      clearSession();
+    }
+    
+    // Update current wallet reference
+    currentWalletRef.current = normalizedAddress;
+
     setIsLoading(true);
     setError(null);
 
     try {
+      // First, try to restore existing session for this wallet
+      const restored = await restoreSessionForWallet(walletAddress, network);
+      if (restored) {
+        setIsLoading(false);
+        return;
+      }
+
+      // Create or get session from backend
       const response = await fetch('/api/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -99,8 +152,12 @@ export function useSession(): UseSessionReturn {
       setSession(data.session);
       setPolicy(data.policy);
       
-      // Store session ID
-      localStorage.setItem('chainpilot_session_id', data.session.id);
+      // Store session ID with wallet-specific key
+      const storageKey = getSessionStorageKey(normalizedAddress);
+      localStorage.setItem(storageKey, data.session.id);
+      
+      // Clear any global legacy key
+      localStorage.removeItem('chainpilot_session_id');
     } catch (err) {
       const error = err instanceof Error ? err : new Error('Failed to create session');
       setError(error);
@@ -108,7 +165,7 @@ export function useSession(): UseSessionReturn {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [clearSession, restoreSessionForWallet]);
 
   const updateNetwork = useCallback(async (network: NetworkType) => {
     if (!session) return;
@@ -168,6 +225,6 @@ export function useSession(): UseSessionReturn {
     createSession,
     updateNetwork,
     updatePolicy,
+    clearSession,
   };
 }
-

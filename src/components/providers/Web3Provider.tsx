@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useEffect, useRef, useCallback, type ReactNode } from 'react';
 import { useWeb3, type UseWeb3Return } from '@/hooks/useWeb3';
-import { useSession } from '@/hooks/useSession';
+import { useSession, getConversationStorageKey } from '@/hooks/useSession';
 import { useConversations, type Conversation } from '@/hooks/useConversations';
 import type { NetworkType } from '@/lib/utils/constants';
 import type { PolicyWithLists } from '@/lib/types';
@@ -35,9 +35,20 @@ interface Web3ProviderProps {
 
 export function Web3Provider({ children }: Web3ProviderProps) {
   const web3 = useWeb3();
-  const { session, policy, createSession, updateNetwork, updatePolicy, isLoading: sessionLoading } = useSession();
+  const { 
+    session, 
+    policy, 
+    createSession, 
+    updateNetwork, 
+    updatePolicy, 
+    clearSession,
+    isLoading: sessionLoading 
+  } = useSession();
   
-  // Conversation management
+  // Track the previous wallet address to detect changes
+  const previousAddressRef = useRef<string | null>(null);
+  
+  // Conversation management - pass wallet address for storage key
   const {
     conversations,
     activeConversationId,
@@ -47,7 +58,12 @@ export function Web3Provider({ children }: Web3ProviderProps) {
     deleteConversation,
     renameConversation,
     loadConversations,
-  } = useConversations({ sessionId: session?.id ?? null, autoLoad: true });
+    clearConversations,
+  } = useConversations({ 
+    sessionId: session?.id ?? null, 
+    walletAddress: web3.address,
+    autoLoad: true 
+  });
   
   // Refs to prevent duplicate calls
   const isCreatingSession = useRef(false);
@@ -67,12 +83,37 @@ export function Web3Provider({ children }: Web3ProviderProps) {
     }
   }, [web3.address, web3.network, createSession]);
 
-  // Auto-create session when wallet connects
+  // Handle wallet connection/change
   useEffect(() => {
+    const currentAddress = web3.address?.toLowerCase() ?? null;
+    const previousAddress = previousAddressRef.current;
+
+    // Detect wallet change
+    if (previousAddress !== null && currentAddress !== null && previousAddress !== currentAddress) {
+      console.log('[Web3Provider] Wallet changed from', previousAddress, 'to', currentAddress);
+      // Clear previous session data
+      clearSession();
+      clearConversations();
+    }
+
+    // Update previous address ref
+    previousAddressRef.current = currentAddress;
+
+    // Initialize session for connected wallet
     if (web3.isConnected && web3.address && web3.network && !session && !sessionLoading && !isCreatingSession.current) {
       initializeSession();
     }
-  }, [web3.isConnected, web3.address, web3.network, session, sessionLoading, initializeSession]);
+  }, [web3.isConnected, web3.address, web3.network, session, sessionLoading, initializeSession, clearSession, clearConversations]);
+
+  // Handle wallet disconnection
+  useEffect(() => {
+    if (!web3.isConnected && session) {
+      console.log('[Web3Provider] Wallet disconnected, clearing session');
+      clearSession();
+      clearConversations();
+      previousAddressRef.current = null;
+    }
+  }, [web3.isConnected, session, clearSession, clearConversations]);
 
   // Update session when network changes
   useEffect(() => {
@@ -137,4 +178,3 @@ export function useRequireWallet(): {
     network,
   };
 }
-

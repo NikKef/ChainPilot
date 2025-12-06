@@ -33,6 +33,14 @@ RULES:
 6. For addresses, preserve the exact format (0x...)
 7. If user references "last contract" or similar, check sessionContext
 
+CRITICAL FOLLOW-UP HANDLING:
+When a partial intent exists from a previous message:
+- If the user provides just an address (0x...) and the previous intent needs an address (tokenAddress, to, contractAddress), KEEP the same intent type and fill in the missing field
+- If the previous intent was "transfer" with a token symbol that couldn't be resolved, and user provides an address, set that as "tokenAddress" in a "transfer" intent
+- DO NOT change the intent type to "explain" or "research" just because the user provided an address
+- Preserve ALL fields from the partial intent and only add/update the missing ones
+- Example: If partial intent was {"type":"transfer","amount":"1","tokenSymbol":"LINK","to":"0x123..."} and user says "0xABC...", return {"type":"transfer","amount":"1","tokenSymbol":"LINK","to":"0x123...","tokenAddress":"0xABC..."}
+
 RESPONSE FORMAT:
 {
   "intent": {
@@ -52,13 +60,28 @@ export function generateContextExtractionPrompt(
   message: string,
   context: SessionContext
 ): string {
+  // Build partial intent context with more detail
+  let partialIntentContext = '';
+  if (context.partialIntent) {
+    const partial = context.partialIntent;
+    partialIntentContext = `
+IMPORTANT - PARTIAL INTENT FROM PREVIOUS MESSAGE:
+The user has an incomplete action in progress. You MUST continue this intent, not start a new one.
+Partial intent: ${JSON.stringify(partial)}
+
+The user's current message is likely providing MISSING information for this intent.
+- If the partial intent is a "transfer" and user provides an address, it's likely the tokenAddress (for unknown tokens) or recipient address (if 'to' is missing)
+- If the partial intent has a tokenSymbol that's not BNB/WBNB/USDT/BUSD/USDC, and user provides an address, that address is the TOKEN CONTRACT ADDRESS
+- DO NOT change the intent type to "explain" or "research" just because an address is provided`;
+  }
+
   const contextInfo = `
 CURRENT SESSION CONTEXT:
 - Network: ${context.network}
 - Wallet: ${context.walletAddress || 'Not connected'}
 ${context.lastContractAddress ? `- Last referenced contract: ${context.lastContractAddress}` : ''}
 ${context.lastTokenAddress ? `- Last referenced token: ${context.lastTokenAddress}` : ''}
-${context.partialIntent ? `- Partial intent from previous message: ${JSON.stringify(context.partialIntent)}` : ''}
+${partialIntentContext}
 
 ${context.chatHistory?.length ? `RECENT CONVERSATION:
 ${context.chatHistory.slice(-3).map(m => `${m.role}: ${m.content}`).join('\n')}` : ''}
@@ -68,7 +91,7 @@ ${context.chatHistory.slice(-3).map(m => `${m.role}: ${m.content}`).join('\n')}`
 
 USER MESSAGE: "${message}"
 
-Analyze this message and extract the intent. Return ONLY valid JSON matching the format specified.`;
+Analyze this message and extract the intent. ${context.partialIntent ? 'REMEMBER: Continue the partial intent, do not start a new one unless the user explicitly changes topic.' : ''} Return ONLY valid JSON matching the format specified.`;
 }
 
 /**

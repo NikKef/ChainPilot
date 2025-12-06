@@ -1,6 +1,7 @@
 'use client';
 
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
+import { getConversationStorageKey } from './useSession';
 
 export interface Conversation {
   id: string;
@@ -15,6 +16,7 @@ export interface Conversation {
 
 interface UseConversationsOptions {
   sessionId: string | null;
+  walletAddress: string | null;
   autoLoad?: boolean;
 }
 
@@ -29,16 +31,39 @@ interface UseConversationsReturn {
   renameConversation: (conversationId: string, title: string) => Promise<void>;
   setActiveConversation: (conversationId: string | null) => void;
   startNewChat: () => Promise<void>;
+  clearConversations: () => void;
 }
 
 export function useConversations({ 
   sessionId, 
+  walletAddress,
   autoLoad = true 
 }: UseConversationsOptions): UseConversationsReturn {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
+  
+  // Track the previous session to detect changes
+  const previousSessionRef = useRef<string | null>(null);
+
+  /**
+   * Get the storage key for active conversation (wallet-specific)
+   */
+  const getStorageKey = useCallback(() => {
+    if (!walletAddress) return null;
+    return getConversationStorageKey(walletAddress);
+  }, [walletAddress]);
+
+  /**
+   * Clear all conversations state
+   */
+  const clearConversations = useCallback(() => {
+    setConversations([]);
+    setActiveConversationId(null);
+    setError(null);
+    previousSessionRef.current = null;
+  }, []);
 
   // Load conversations from API
   const loadConversations = useCallback(async () => {
@@ -58,9 +83,18 @@ export function useConversations({
       const data = await response.json();
       setConversations(data.conversations || []);
 
-      // Auto-select the most recent conversation if none is active
-      if (!activeConversationId && data.conversations?.length > 0) {
+      // Try to restore active conversation from wallet-specific storage
+      const storageKey = getStorageKey();
+      const storedConversationId = storageKey ? localStorage.getItem(storageKey) : null;
+      
+      if (storedConversationId && data.conversations?.some((c: Conversation) => c.id === storedConversationId)) {
+        // Restore the stored conversation
+        setActiveConversationId(storedConversationId);
+      } else if (data.conversations?.length > 0) {
+        // Auto-select the most recent conversation
         setActiveConversationId(data.conversations[0].id);
+      } else {
+        setActiveConversationId(null);
       }
     } catch (err) {
       const error = err instanceof Error ? err : new Error('Failed to load conversations');
@@ -68,7 +102,7 @@ export function useConversations({
     } finally {
       setIsLoading(false);
     }
-  }, [sessionId, activeConversationId]);
+  }, [sessionId, getStorageKey]);
 
   // Create a new conversation
   const createConversation = useCallback(async (title?: string): Promise<Conversation | null> => {
@@ -95,8 +129,12 @@ export function useConversations({
       // Add to list
       setConversations(prev => [newConversation, ...prev]);
       
-      // Set as active
+      // Set as active and store in wallet-specific key
       setActiveConversationId(newConversation.id);
+      const storageKey = getStorageKey();
+      if (storageKey) {
+        localStorage.setItem(storageKey, newConversation.id);
+      }
 
       return newConversation;
     } catch (err) {
@@ -106,7 +144,7 @@ export function useConversations({
     } finally {
       setIsLoading(false);
     }
-  }, [sessionId]);
+  }, [sessionId, getStorageKey]);
 
   // Delete a conversation
   const deleteConversation = useCallback(async (conversationId: string) => {
@@ -131,7 +169,17 @@ export function useConversations({
         if (activeConversationId === conversationId) {
           const nextConversation = remaining.length > 0 ? remaining[0].id : null;
           // Use setTimeout to avoid state update during render
-          setTimeout(() => setActiveConversationId(nextConversation), 0);
+          setTimeout(() => {
+            setActiveConversationId(nextConversation);
+            const storageKey = getStorageKey();
+            if (storageKey) {
+              if (nextConversation) {
+                localStorage.setItem(storageKey, nextConversation);
+              } else {
+                localStorage.removeItem(storageKey);
+              }
+            }
+          }, 0);
         }
         
         return remaining;
@@ -142,7 +190,7 @@ export function useConversations({
     } finally {
       setIsLoading(false);
     }
-  }, [activeConversationId]);
+  }, [activeConversationId, getStorageKey]);
 
   // Rename a conversation
   const renameConversation = useCallback(async (conversationId: string, title: string) => {
@@ -176,13 +224,19 @@ export function useConversations({
   const setActiveConversation = useCallback((conversationId: string | null) => {
     setActiveConversationId(conversationId);
     
-    // Store in localStorage for persistence across page navigations
-    if (conversationId) {
-      localStorage.setItem('chainpilot_active_conversation', conversationId);
-    } else {
-      localStorage.removeItem('chainpilot_active_conversation');
+    // Store in wallet-specific localStorage key
+    const storageKey = getStorageKey();
+    if (storageKey) {
+      if (conversationId) {
+        localStorage.setItem(storageKey, conversationId);
+      } else {
+        localStorage.removeItem(storageKey);
+      }
     }
-  }, []);
+    
+    // Clear legacy global key
+    localStorage.removeItem('chainpilot_active_conversation');
+  }, [getStorageKey]);
 
   // Start a new chat (create new conversation and set as active)
   const startNewChat = useCallback(async () => {
@@ -192,29 +246,22 @@ export function useConversations({
     }
   }, [createConversation, setActiveConversation]);
 
-  // Auto-load conversations when sessionId changes
+  // Handle session changes - reload conversations when session changes
   useEffect(() => {
-    if (autoLoad && sessionId) {
-      loadConversations();
-    }
-  }, [autoLoad, sessionId, loadConversations]);
-
-  // Restore active conversation from localStorage
-  useEffect(() => {
-    if (!activeConversationId) {
-      const stored = localStorage.getItem('chainpilot_active_conversation');
-      if (stored && conversations.some(c => c.id === stored)) {
-        setActiveConversationId(stored);
+    if (sessionId !== previousSessionRef.current) {
+      // Session changed, clear old data and reload
+      if (previousSessionRef.current !== null && sessionId !== previousSessionRef.current) {
+        setConversations([]);
+        setActiveConversationId(null);
+      }
+      
+      previousSessionRef.current = sessionId;
+      
+      if (autoLoad && sessionId) {
+        loadConversations();
       }
     }
-  }, [conversations, activeConversationId]);
-
-  // Update local conversation data when it changes (e.g., new message updates title)
-  const updateConversationInList = useCallback((updatedConversation: Conversation) => {
-    setConversations(prev =>
-      prev.map(c => c.id === updatedConversation.id ? updatedConversation : c)
-    );
-  }, []);
+  }, [autoLoad, sessionId, loadConversations]);
 
   return {
     conversations,
@@ -227,6 +274,6 @@ export function useConversations({
     renameConversation,
     setActiveConversation,
     startNewChat,
+    clearConversations,
   };
 }
-

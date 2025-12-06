@@ -302,6 +302,7 @@ export async function createTransactionPreview(
   params: {
     from: string;
     network: NetworkType;
+    recipient?: string; // The actual recipient for transfers (different from preparedTx.to for token transfers)
     tokenSymbol?: string;
     tokenAddress?: string;
     amount?: string;
@@ -315,11 +316,15 @@ export async function createTransactionPreview(
 ): Promise<TransactionPreview> {
   const gasEstimate = await estimateTransactionGas(preparedTx, params.network);
 
+  // For token transfers, preparedTx.to is the token contract, not the actual recipient
+  // Use params.recipient for the display "to" address when provided
+  const displayTo = params.recipient || preparedTx.to;
+
   const preview: TransactionPreview = {
     type,
     network: params.network,
     from: params.from,
-    to: preparedTx.to,
+    to: displayTo,
     preparedTx,
     estimatedGas: gasEstimate.gasLimit.toString(),
     estimatedGasPrice: gasEstimate.gasPrice.toString(),

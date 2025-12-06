@@ -2,9 +2,14 @@
 
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { BrowserProvider, parseEther, formatEther } from 'ethers';
-import type { ChatMessage, ChatResponse, TransactionPreview, PolicyEvaluationResult } from '@/lib/types';
+import type { ChatMessage, ChatResponse, TransactionPreview, PolicyEvaluationResult, Intent } from '@/lib/types';
 import { useQ402 } from './useQ402';
 import { getNativeBalance } from '@/lib/services/web3/provider';
+import { 
+  logTransactionSuccess, 
+  logTransactionFailure, 
+  logTransactionCancelled 
+} from '@/lib/services/activity';
 
 /**
  * Check if a transaction is a native BNB transfer (not a contract interaction)
@@ -18,9 +23,29 @@ function isNativeBnbTransfer(preview: TransactionPreview): boolean {
   const isTransferType = preview.type === 'transfer';
   const isNativeToken = !preview.tokenAddress || 
     preview.tokenAddress === '0x0000000000000000000000000000000000000000';
-  const hasNativeValue = preview.nativeValue && parseFloat(preview.nativeValue) > 0;
+  const hasNativeValue = Boolean(preview.nativeValue && parseFloat(preview.nativeValue) > 0);
   
   return isTransferType && isNativeToken && hasNativeValue;
+}
+
+/**
+ * Get intent type from transaction preview
+ */
+function getIntentTypeFromPreview(preview: TransactionPreview): Intent['type'] {
+  switch (preview.type) {
+    case 'transfer':
+      return 'transfer';
+    case 'token_transfer':
+      return 'transfer';
+    case 'swap':
+      return 'swap';
+    case 'contract_call':
+      return 'contract_call';
+    case 'deploy':
+      return 'deploy';
+    default:
+      return 'transfer';
+  }
 }
 
 interface UseChatOptions {
@@ -65,6 +90,7 @@ export function useChat({
   const [pendingTransaction, setPendingTransaction] = useState<TransactionPreview | null>(null);
   const [policyDecision, setPolicyDecision] = useState<PolicyEvaluationResult | null>(null);
   const [currentConversationId, setCurrentConversationId] = useState<string | null>(conversationId || null);
+  const [lastUserMessage, setLastUserMessage] = useState<string | undefined>(undefined);
   
   const abortControllerRef = useRef<AbortController | null>(null);
   const loadedConversationRef = useRef<string | null>(null);
@@ -134,6 +160,9 @@ export function useChat({
       abortControllerRef.current.abort();
     }
     abortControllerRef.current = new AbortController();
+
+    // Store the user message for activity logging
+    setLastUserMessage(content);
 
     // Add user message immediately
     const userMessage: ChatMessage = {
@@ -240,6 +269,8 @@ export function useChat({
     console.log('[Chat] Starting transaction flow...');
     setIsLoading(true);
     
+    const intentType = getIntentTypeFromPreview(pendingTransaction);
+    
     try {
       // Check if this is a native BNB transfer - must be executed directly by user
       if (isNativeBnbTransfer(pendingTransaction)) {
@@ -258,6 +289,17 @@ export function useChat({
             const balanceFormatted = formatEther(balance);
             const costFormatted = formatEther(totalCost);
             const gasCostFormatted = formatEther(gasCost);
+
+            // Log failed transaction to activity
+            await logTransactionFailure({
+              sessionId,
+              intentType,
+              network: pendingTransaction.network,
+              userMessage: lastUserMessage,
+              preview: pendingTransaction,
+              policyDecision,
+              errorMessage: 'Insufficient balance for transfer',
+            });
 
             setMessages(prev => [...prev, {
               id: `msg_${Date.now()}_error`,
@@ -295,6 +337,18 @@ export function useChat({
         const receipt = await tx.wait(1);
         
         if (receipt?.status === 1) {
+          // Log successful transaction to activity
+          await logTransactionSuccess({
+            sessionId,
+            intentType,
+            network: pendingTransaction.network,
+            userMessage: lastUserMessage,
+            preview: pendingTransaction,
+            policyDecision,
+            txHash: tx.hash,
+            estimatedValueUsd: pendingTransaction.valueUsd ? parseFloat(pendingTransaction.valueUsd) : undefined,
+          });
+
           setMessages(prev => {
             const filtered = prev.filter(m => !m.content.includes('Please confirm the transaction'));
             return [...filtered, {
@@ -307,6 +361,16 @@ export function useChat({
           });
           onTransactionSuccess?.(tx.hash);
         } else {
+          // Log failed transaction
+          await logTransactionFailure({
+            sessionId,
+            intentType,
+            network: pendingTransaction.network,
+            userMessage: lastUserMessage,
+            preview: pendingTransaction,
+            policyDecision,
+            errorMessage: 'Transaction failed on-chain',
+          });
           throw new Error('Transaction failed on-chain');
         }
         
@@ -344,6 +408,19 @@ export function useChat({
       console.log('[Chat] prepareAndSign result:', result);
 
       if (result?.success && result.txHash) {
+        // Log successful transaction to activity
+        await logTransactionSuccess({
+          sessionId,
+          intentType,
+          network: pendingTransaction.network,
+          userMessage: lastUserMessage,
+          preview: pendingTransaction,
+          policyDecision,
+          txHash: result.txHash,
+          q402RequestId: result.q402RequestId,
+          estimatedValueUsd: pendingTransaction.valueUsd ? parseFloat(pendingTransaction.valueUsd) : undefined,
+        });
+
         // Add success message
         setMessages(prev => {
           // Remove the signing message
@@ -357,7 +434,14 @@ export function useChat({
           }];
         });
       } else if (result === null) {
-        // User cancelled signing or there was an error
+        // User cancelled signing
+        await logTransactionCancelled({
+          sessionId,
+          intentType,
+          network: pendingTransaction.network,
+          userMessage: lastUserMessage,
+        });
+
         setMessages(prev => {
           const filtered = prev.filter(m => !m.content.includes('Please sign the transaction'));
           return [...filtered, {
@@ -370,13 +454,24 @@ export function useChat({
         });
       } else {
         // Transaction submitted but may have failed on-chain
+        await logTransactionFailure({
+          sessionId,
+          intentType,
+          network: pendingTransaction.network,
+          userMessage: lastUserMessage,
+          preview: pendingTransaction,
+          policyDecision,
+          errorMessage: result?.error || 'Transaction status unknown',
+          q402RequestId: result?.q402RequestId,
+        });
+
         setMessages(prev => {
           const filtered = prev.filter(m => !m.content.includes('Please sign the transaction'));
           return [...filtered, {
             id: `msg_${Date.now()}_result`,
             sessionId,
             role: 'assistant',
-            content: result.error 
+            content: result?.error 
               ? `Transaction failed: ${result.error}`
               : 'Transaction submitted but status unknown. Please check the activity log.',
             createdAt: new Date().toISOString(),
@@ -406,6 +501,17 @@ export function useChat({
         errorMessage = 'Transaction cancelled by user';
       }
 
+      // Log failed transaction to activity
+      await logTransactionFailure({
+        sessionId,
+        intentType,
+        network: pendingTransaction.network,
+        userMessage: lastUserMessage,
+        preview: pendingTransaction,
+        policyDecision,
+        errorMessage,
+      });
+
       setError(error);
       onError?.(error);
 
@@ -422,9 +528,20 @@ export function useChat({
     } finally {
       setIsLoading(false);
     }
-  }, [pendingTransaction, policyDecision, sessionId, provider, onError, prepareAndSign, resetQ402]);
+  }, [pendingTransaction, policyDecision, sessionId, provider, signerAddress, lastUserMessage, onError, onTransactionSuccess, prepareAndSign, resetQ402]);
 
-  const rejectTransaction = useCallback(() => {
+  const rejectTransaction = useCallback(async () => {
+    // Log cancelled transaction to activity
+    if (pendingTransaction) {
+      const intentType = getIntentTypeFromPreview(pendingTransaction);
+      await logTransactionCancelled({
+        sessionId,
+        intentType,
+        network: pendingTransaction.network,
+        userMessage: lastUserMessage,
+      });
+    }
+
     setPendingTransaction(null);
     setPolicyDecision(null);
 
@@ -435,7 +552,7 @@ export function useChat({
       content: 'Transaction cancelled. Let me know if you\'d like to try something else.',
       createdAt: new Date().toISOString(),
     }]);
-  }, [sessionId]);
+  }, [sessionId, pendingTransaction, lastUserMessage]);
 
   const clearMessages = useCallback(() => {
     setMessages([]);
@@ -444,6 +561,7 @@ export function useChat({
     setError(null);
     setCurrentConversationId(null);
     loadedConversationRef.current = null;
+    setLastUserMessage(undefined);
   }, []);
 
   return {
@@ -462,4 +580,3 @@ export function useChat({
     loadMessages,
   };
 }
-

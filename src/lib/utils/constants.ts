@@ -80,12 +80,25 @@ export const TOKENS = {
     USDT: '0x337610d27c682E347C9cD60BD4b3b107C9d34dDd',
     BUSD: '0xeD24FC36d5Ee211Ea25A80239Fb8C4Cfd80f12Ee',
     USDC: '0x64544969ed7EBf5f083679233325356EbE738930',
+    // Additional common testnet tokens (may need to be updated with actual testnet addresses)
+    LINK: '0x84b9B910527Ad5C03A9Ca831909E21e236EA7b06', // Chainlink testnet
+    CAKE: '0xFa60D973F7642B748046464e165A65B7323b0DEE', // PancakeSwap testnet
+    DAI: '0x8a9424745056Eb399FD19a0EC26A14316684e274', // DAI testnet
   },
   mainnet: {
     WBNB: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
     USDT: '0x55d398326f99059fF775485246999027B3197955',
     BUSD: '0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56',
     USDC: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d',
+    // Additional common mainnet tokens
+    LINK: '0xF8A0BF9cF54Bb92F17374d9e9A321E6a111a51bD', // Chainlink on BSC
+    CAKE: '0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82', // PancakeSwap
+    DAI: '0x1AF3F329e8BE154074D8769D1FFa4eE058B1DBc3', // DAI on BSC
+    ETH: '0x2170Ed0880ac9A755fd29B2688956BD959F933F8', // Binance-Peg Ethereum
+    BTCB: '0x7130d2A12B9BCbFAe4f2634d864A1Ee1Ce3Ead9c', // Binance-Peg BTC
+    XRP: '0x1D2F0da169ceB9fC7B3144628dB156f3F6c60dBE', // Binance-Peg XRP
+    DOGE: '0xbA2aE424d960c26247Dd6c32edC70B295c744C43', // Binance-Peg Dogecoin
+    SHIB: '0x2859e4544C4bB03966803b044A93563Bd2D0DD4D', // SHIBA INU
   },
 } as const;
 
@@ -96,6 +109,14 @@ export const TOKEN_SYMBOLS: Record<string, Record<NetworkType, string>> = {
   USDT: { testnet: TOKENS.testnet.USDT, mainnet: TOKENS.mainnet.USDT },
   BUSD: { testnet: TOKENS.testnet.BUSD, mainnet: TOKENS.mainnet.BUSD },
   USDC: { testnet: TOKENS.testnet.USDC, mainnet: TOKENS.mainnet.USDC },
+  LINK: { testnet: TOKENS.testnet.LINK, mainnet: TOKENS.mainnet.LINK },
+  CAKE: { testnet: TOKENS.testnet.CAKE, mainnet: TOKENS.mainnet.CAKE },
+  DAI: { testnet: TOKENS.testnet.DAI, mainnet: TOKENS.mainnet.DAI },
+  ETH: { testnet: '', mainnet: TOKENS.mainnet.ETH }, // ETH only on mainnet
+  BTCB: { testnet: '', mainnet: TOKENS.mainnet.BTCB },
+  XRP: { testnet: '', mainnet: TOKENS.mainnet.XRP },
+  DOGE: { testnet: '', mainnet: TOKENS.mainnet.DOGE },
+  SHIB: { testnet: '', mainnet: TOKENS.mainnet.SHIB },
 };
 
 // Default policy values

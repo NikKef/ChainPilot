@@ -29,15 +29,28 @@ function intentNeedsFollowUp(intent: Intent): boolean {
   // Base check using required fields
   if (!isIntentComplete(intent)) return true;
 
-  // Additional heuristics for symbol-only tokens
+  // Additional heuristics for symbol-only tokens that couldn't be resolved
   if (intent.type === 'transfer') {
     const t = intent as TransferIntent;
-    if (t.tokenSymbol && !t.tokenAddress) return true;
+    // Only needs follow-up if there's a non-native token symbol without an address
+    if (t.tokenSymbol && 
+        t.tokenSymbol.toUpperCase() !== 'BNB' && 
+        !t.tokenAddress) {
+      return true;
+    }
   }
 
   if (intent.type === 'swap') {
     const s = intent as SwapIntent;
-    if ((s.tokenInSymbol && !s.tokenIn) || (s.tokenOutSymbol && !s.tokenOut)) {
+    // Check tokenIn - needs follow-up if symbol exists but no address and not native
+    const tokenInNeedsAddress = s.tokenInSymbol && 
+                                s.tokenInSymbol.toUpperCase() !== 'BNB' && 
+                                !s.tokenIn;
+    // Check tokenOut - needs follow-up if symbol exists but no address and not native
+    const tokenOutNeedsAddress = s.tokenOutSymbol && 
+                                 s.tokenOutSymbol.toUpperCase() !== 'BNB' && 
+                                 !s.tokenOut;
+    if (tokenInNeedsAddress || tokenOutNeedsAddress) {
       return true;
     }
   }
@@ -422,7 +435,7 @@ async function buildResponse(
           },
           intent,
           requiresFollowUp: true,
-          followUpQuestions: missingFields.map(f => 
+          followUpQuestions: missingFields.map((f: string) => 
             f === 'to' ? 'What address would you like to send to?' : `How much would you like to send?`
           ),
         };
@@ -457,6 +470,7 @@ async function buildResponse(
         {
           from: walletAddress,
           network,
+          recipient: transferIntent.to, // The actual recipient address
           tokenSymbol,
           tokenAddress: transferIntent.tokenAddress || undefined,
           amount: transferIntent.amount,

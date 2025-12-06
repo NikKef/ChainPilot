@@ -202,7 +202,8 @@ export async function POST(request: NextRequest) {
       network,
       walletAddress,
       body.sessionId,
-      conversationId
+      conversationId,
+      chatHistory
     );
 
     // Save assistant message to database (let DB generate UUID)
@@ -253,7 +254,8 @@ async function buildResponse(
   network: NetworkType,
   walletAddress: string,
   sessionId: string,
-  conversationId: string
+  conversationId: string,
+  chatHistory?: { role: 'user' | 'assistant'; content: string }[]
 ): Promise<ChatResponse> {
   const { intent, missingFields, questions, requiresFollowUp, confidence } = extractionResult;
 
@@ -279,9 +281,10 @@ async function buildResponse(
     case 'research': {
       // Use the original user message as the query if intent.query is empty
       const query = intent.query || userMessage;
-      logger.debug('Research query', { query, intentQuery: intent.query, userMessage });
+      logger.debug('Research query', { query, intentQuery: intent.query, userMessage, conversationId });
       
-      const result = await researchTopic(query, intent.topics);
+      // Pass conversationId to enable follow-up questions with context
+      const result = await researchTopic(query, intent.topics, conversationId);
       return {
         message: {
           id: generateId(),
@@ -301,13 +304,15 @@ async function buildResponse(
       let content = '';
       // Use the original user message as the query if intent.query is empty
       const query = intent.query || userMessage;
-      logger.debug('Explain query', { query, intentQuery: intent.query, userMessage, address: intent.address });
+      logger.debug('Explain query', { query, intentQuery: intent.query, userMessage, address: intent.address, conversationId });
       
       if (intent.address) {
-        const result = await explainContract(intent.address, network);
+        // Pass conversationId to enable follow-up questions with context
+        const result = await explainContract(intent.address, network, undefined, conversationId);
         content = result.explanation;
       } else {
-        const result = await researchTopic(query);
+        // Pass conversationId to enable follow-up questions with context
+        const result = await researchTopic(query, undefined, conversationId);
         content = result.answer;
       }
       return {
@@ -328,9 +333,14 @@ async function buildResponse(
     case 'generate_contract': {
       // Use intent.specText if available, otherwise fall back to the original user message
       const specText = intent.specText || userMessage;
-      logger.debug('Generating contract', { specText, intentSpecText: intent.specText, userMessage });
+      logger.debug('Generating contract', { specText, intentSpecText: intent.specText, userMessage, conversationId });
       
-      const result = await chainGPT.generateContract(specText);
+      // Use the Smart Contract Generator API with session context for iterative refinement
+      // The conversationId enables chat history for follow-up modifications
+      const result = await chainGPT.generateContract(specText, {
+        chatHistory: conversationId ? 'on' : 'off',
+        sdkUniqueId: conversationId,
+      });
       let content = '';
       if (result.success && result.sourceCode) {
         // Show full contract code (no truncation)
@@ -402,17 +412,123 @@ async function buildResponse(
         };
       }
 
-      const sourceCode = intent.sourceCode || '';
-      // In production, fetch source code from address if not provided
-      const auditResult = await chainGPT.auditContract(sourceCode);
+      // Determine the chain for auditing
+      // Check if user specified a chain in their message or intent
+      let auditChain: string | undefined = intent.chain;
+      
+      // If no explicit chain, detect from conversation (current message + history)
+      if (!auditChain) {
+        // Build full conversation text to search for chain mentions
+        const conversationText = [
+          userMessage,
+          ...(chatHistory?.map(m => m.content) || [])
+        ].join(' ').toLowerCase();
+        
+        logger.debug('Chain detection - conversation text', { 
+          conversationText: conversationText.substring(0, 500),
+          hasHistory: !!chatHistory?.length,
+          historyLength: chatHistory?.length || 0,
+        });
+        
+        // Only check USER messages for chain detection (ignore assistant responses which might contain "testnet" from errors)
+        const userMessages = [
+          userMessage,
+          ...(chatHistory?.filter(m => m.role === 'user').map(m => m.content) || [])
+        ].join(' ').toLowerCase();
+        
+        logger.debug('Chain detection - user messages only', { userMessages: userMessages.substring(0, 300) });
+        
+        // Check for explicit testnet mentions in USER messages only
+        if (userMessages.includes('bsc testnet') || userMessages.includes('bnb testnet') || 
+            userMessages.includes('bnb smart chain testnet') || userMessages.includes('binance testnet')) {
+          auditChain = 'BNB Smart Chain Testnet';
+        } 
+        // "BNB Smart Chain" = mainnet (this is the standard way to refer to BSC mainnet)
+        else if (userMessages.includes('bnb smart chain') || userMessages.includes('binance smart chain') ||
+                 userMessages.includes('bsc mainnet') || userMessages.includes('bnb mainnet')) {
+          auditChain = 'BNB Smart Chain';
+        }
+        // Just "BSC" or "BNB" = mainnet by default (unless testnet explicitly mentioned)
+        else if (userMessages.includes('bsc') || userMessages.includes('bnb')) {
+          auditChain = 'BNB Smart Chain';
+        }
+        else if (userMessages.includes('ethereum') || userMessages.includes('eth mainnet')) {
+          auditChain = 'Ethereum';
+        } else if (userMessages.includes('polygon')) {
+          auditChain = 'Polygon';
+        } else if (userMessages.includes('arbitrum')) {
+          auditChain = 'Arbitrum';
+        } else if (userMessages.includes('avalanche') || userMessages.includes('avax')) {
+          auditChain = 'Avalanche';
+        }
+        
+        logger.debug('Chain detection result', { detectedChain: auditChain });
+      }
+      
+      // Determine effective network from chain name
+      let effectiveNetwork: 'testnet' | 'mainnet' | undefined;
+      if (auditChain) {
+        // If chain explicitly mentions testnet, use testnet; otherwise mainnet
+        effectiveNetwork = auditChain.toLowerCase().includes('testnet') ? 'testnet' : 'mainnet';
+      } else {
+        // Default to current connected network if no chain specified
+        effectiveNetwork = network;
+      }
+      
+      logger.info('Starting contract audit', { 
+        address: intent.address,
+        hasSourceCode: !!intent.sourceCode,
+        auditChain,
+        effectiveNetwork,
+      });
 
-      const content = `## Audit Results\n\n**Risk Level:** ${auditResult.riskLevel}\n\n${auditResult.summary}\n\n` +
-        (auditResult.majorFindings.length > 0 
-          ? `### Major Findings\n${auditResult.majorFindings.map(f => `- **${f.title}**: ${f.description}`).join('\n')}\n\n`
-          : '') +
-        (auditResult.recommendations.length > 0
-          ? `### Recommendations\n${auditResult.recommendations.map(r => `- ${r}`).join('\n')}`
-          : '');
+      // Perform the audit
+      // If we have an address, the auditor will fetch the source code from BscScan
+      // If we have source code directly, it will use that
+      const auditInput = intent.sourceCode || intent.address || '';
+      const isContractAddress = !intent.sourceCode && !!intent.address;
+      
+      const auditResult = await chainGPT.auditContract(auditInput, {
+        network: effectiveNetwork,
+        chain: auditChain,
+        isContractAddress,
+      });
+
+      // Build response with more detailed findings
+      const chainInfo = auditChain || (network === 'testnet' ? 'BNB Smart Chain Testnet' : 'BNB Smart Chain');
+      const addressInfo = intent.address 
+        ? `**Contract:** \`${intent.address}\`\n**Chain:** ${chainInfo}\n\n` 
+        : '';
+      
+      // Check if audit failed (e.g., couldn't fetch source code)
+      if (!auditResult.success && auditResult.error) {
+        const explorerUrl = network === 'testnet' 
+          ? `https://testnet.bscscan.com/address/${intent.address}#code`
+          : `https://bscscan.com/address/${intent.address}#code`;
+        
+        const errorContent = `## Unable to Audit Contract\n\n${addressInfo}${auditResult.summary}\n\n` +
+          `**Options:**\n` +
+          `1. [Verify the contract source on BscScan](${explorerUrl})\n` +
+          `2. Paste the contract source code directly and I'll audit it\n\n` +
+          `**Note:** I can only audit verified contracts or source code you provide directly.`;
+        
+        return {
+          message: {
+            id: generateId(),
+            sessionId,
+            role: 'assistant',
+            content: errorContent,
+            intent,
+            createdAt: new Date().toISOString(),
+          },
+          intent,
+          requiresFollowUp: true,
+          followUpQuestions: ['Would you like to paste the contract source code for auditing?'],
+        };
+      }
+      
+      // Display the formatted audit response directly from ChainGPT
+      const content = `## Audit Results\n\n${addressInfo}${auditResult.summary}`;
 
       return {
         message: {
@@ -723,7 +839,8 @@ async function buildResponse(
           network,
           walletAddress,
           sessionId,
-          conversationId
+          conversationId,
+          chatHistory
         );
       }
       

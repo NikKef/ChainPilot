@@ -1,31 +1,27 @@
-import { GeneralChat } from '@chaingpt/generalchat';
+import axios from 'axios';
 import { logger } from '@/lib/utils';
 import { ExternalApiError } from '@/lib/utils/errors';
 import type { ContractGenerationResult } from '@/lib/types';
 import { CONTRACT_GENERATION_PROMPT } from './prompts';
 
-// Lazy initialization of the GeneralChat client
-let generatorClient: GeneralChat | null = null;
+// Smart Contract Generator API endpoint (per ChainGPT documentation)
+const SMART_CONTRACT_GENERATOR_API_URL = 'https://api.chaingpt.org/chat/stream';
+const SMART_CONTRACT_GENERATOR_MODEL = 'smart_contract_generator';
 
-function getGeneratorClient(): GeneralChat {
-  if (!generatorClient) {
-    const apiKey = process.env.CHAINGPT_API_KEY;
-    
-    if (!apiKey) {
-      throw new ExternalApiError('ChainGPT', 'API key not configured');
-    }
-
-    generatorClient = new GeneralChat({
-      apiKey,
-    });
-  }
-  
-  return generatorClient;
+/**
+ * Interface for Smart Contract Generator API response
+ */
+interface SmartContractGeneratorResponse {
+  status: string;
+  data: {
+    user: string;
+    bot: string;
+  };
 }
 
 /**
- * Extract content from ChainGPT SDK response
- * The SDK returns { data: { bot: string } } format
+ * Extract content from ChainGPT Smart Contract Generator API response
+ * The API returns { status: "success", data: { user: string, bot: string } } format
  */
 function extractContentFromResponse(response: unknown): string {
   // Handle string response
@@ -33,11 +29,11 @@ function extractContentFromResponse(response: unknown): string {
     return response;
   }
   
-  // Handle object response - SDK returns { data: { bot: string } }
+  // Handle object response - API returns { status, data: { user, bot } }
   if (response && typeof response === 'object') {
     const obj = response as Record<string, unknown>;
     
-    // Check for nested data.bot structure (official SDK format)
+    // Check for nested data.bot structure (official API format)
     if (obj.data && typeof obj.data === 'object') {
       const data = obj.data as Record<string, unknown>;
       if (typeof data.bot === 'string') return data.bot;
@@ -73,7 +69,8 @@ function extractContentFromResponse(response: unknown): string {
 }
 
 /**
- * Generate a smart contract from natural language specification
+ * Generate a smart contract from natural language specification using the ChainGPT Smart Contract Generator API
+ * Uses the dedicated smart_contract_generator model for production-ready contracts
  */
 export async function generateContract(
   specText: string,
@@ -81,6 +78,8 @@ export async function generateContract(
     contractType?: string;
     features?: string[];
     optimize?: boolean;
+    chatHistory?: 'on' | 'off';
+    sdkUniqueId?: string;
   }
 ): Promise<ContractGenerationResult> {
   // Validate specText is provided
@@ -98,46 +97,76 @@ export async function generateContract(
     throw new ExternalApiError('ChainGPT', 'API key not configured');
   }
 
-  logger.chainGptCall('contract-generator', { specLength: specText.length });
+  logger.chainGptCall('smart-contract-generator', { 
+    specLength: specText.length,
+    contractType: options?.contractType,
+    hasFeatures: !!options?.features?.length,
+  });
 
   // Build enhanced specification
   const enhancedSpec = buildEnhancedSpec(specText, options);
 
-  try {
-    const client = getGeneratorClient();
-
-    // Build the full question with system context
-    const fullQuestion = `${CONTRACT_GENERATION_PROMPT}
+  // Build the full question with system context
+  const fullQuestion = `${CONTRACT_GENERATION_PROMPT}
 
 ---
 
 User Request:
 ${enhancedSpec}`;
 
-    // Use createChatBlob for non-streaming response
-    const response = await client.createChatBlob({
-      question: fullQuestion,
-      chatHistory: 'off',
-      useCustomContext: false,
+  try {
+    logger.debug('Sending generation request to ChainGPT Smart Contract Generator API', { 
+      promptLength: fullQuestion.length,
+      model: SMART_CONTRACT_GENERATOR_MODEL,
     });
 
-    // Extract the response content using helper function
-    const generatedCode = extractContentFromResponse(response);
+    // Call the Smart Contract Generator API directly (per documentation)
+    const response = await axios.post<SmartContractGeneratorResponse>(
+      SMART_CONTRACT_GENERATOR_API_URL,
+      {
+        model: SMART_CONTRACT_GENERATOR_MODEL,
+        question: fullQuestion,
+        chatHistory: options?.chatHistory || 'off',
+        ...(options?.sdkUniqueId && { sdkUniqueId: options.sdkUniqueId }),
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        // Don't use streaming for blob response - wait for full response
+        responseType: 'json',
+      }
+    );
+
+    // Extract the response content
+    const generatedCode = extractContentFromResponse(response.data);
 
     if (!generatedCode) {
-      throw new ExternalApiError('ChainGPT', 'Empty response from contract generator');
+      throw new ExternalApiError('ChainGPT', 'Empty response from Smart Contract Generator');
     }
+
+    logger.debug('Received generation response from ChainGPT', { 
+      responseLength: generatedCode.length,
+      status: response.data.status,
+    });
 
     // Extract and validate the Solidity code
     const sourceCode = extractSolidityCode(generatedCode);
     const contractName = extractContractName(sourceCode);
     const warnings = validateGeneratedCode(sourceCode);
 
+    logger.info('Contract generation completed', {
+      contractName,
+      sourceLength: sourceCode.length,
+      warningsCount: warnings.length,
+    });
+
     return {
       success: true,
       sourceCode,
       contractName,
-      description: `Generated contract based on: ${specText.slice(0, 100)}...`,
+      description: `Generated contract based on: ${specText.slice(0, 100)}${specText.length > 100 ? '...' : ''}`,
       warnings: warnings.length > 0 ? warnings : undefined,
     };
   } catch (error) {
@@ -145,10 +174,187 @@ ${enhancedSpec}`;
       throw error;
     }
 
+    // Handle axios errors
+    if (axios.isAxiosError(error)) {
+      const errorMessage = error.response?.data?.message || error.response?.data?.error || error.message;
+      logger.error('Smart Contract Generator API call failed', { 
+        status: error.response?.status,
+        error: errorMessage,
+      });
+      return {
+        success: false,
+        error: `Smart Contract Generator API error: ${errorMessage}`,
+      };
+    }
+
     logger.error('Contract generation failed', error);
     return {
       success: false,
       error: error instanceof Error ? error.message : 'Unknown error during contract generation',
+    };
+  }
+}
+
+/**
+ * Generate a smart contract with streaming support
+ * Useful for real-time feedback during contract generation
+ */
+export async function* streamContractGeneration(
+  specText: string,
+  options?: {
+    contractType?: string;
+    features?: string[];
+    optimize?: boolean;
+    chatHistory?: 'on' | 'off';
+    sdkUniqueId?: string;
+  }
+): AsyncGenerator<string, ContractGenerationResult, unknown> {
+  // Validate specText is provided
+  if (!specText || typeof specText !== 'string' || specText.trim().length === 0) {
+    logger.warn('streamContractGeneration called with invalid specText', { specText });
+    return {
+      success: false,
+      error: 'Please provide a description of the contract you want to generate.',
+    };
+  }
+
+  const apiKey = process.env.CHAINGPT_API_KEY;
+  
+  if (!apiKey) {
+    throw new ExternalApiError('ChainGPT', 'API key not configured');
+  }
+
+  logger.chainGptCall('smart-contract-generator-stream', { 
+    specLength: specText.length,
+    contractType: options?.contractType,
+  });
+
+  // Build enhanced specification
+  const enhancedSpec = buildEnhancedSpec(specText, options);
+
+  const fullQuestion = `${CONTRACT_GENERATION_PROMPT}
+
+---
+
+User Request:
+${enhancedSpec}`;
+
+  try {
+    logger.debug('Sending streaming request to ChainGPT Smart Contract Generator API');
+
+    // Call the API with streaming enabled
+    const response = await axios.post(
+      SMART_CONTRACT_GENERATOR_API_URL,
+      {
+        model: SMART_CONTRACT_GENERATOR_MODEL,
+        question: fullQuestion,
+        chatHistory: options?.chatHistory || 'off',
+        ...(options?.sdkUniqueId && { sdkUniqueId: options.sdkUniqueId }),
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        responseType: 'stream',
+      }
+    );
+
+    let fullContent = '';
+
+    // Process the stream
+    for await (const chunk of response.data) {
+      const chunkStr = chunk.toString();
+      fullContent += chunkStr;
+      yield chunkStr;
+    }
+
+    // Extract and validate the complete code
+    const sourceCode = extractSolidityCode(fullContent);
+    const contractName = extractContractName(sourceCode);
+    const warnings = validateGeneratedCode(sourceCode);
+
+    logger.info('Streaming contract generation completed', {
+      contractName,
+      sourceLength: sourceCode.length,
+    });
+
+    return {
+      success: true,
+      sourceCode,
+      contractName,
+      description: `Generated contract based on: ${specText.slice(0, 100)}${specText.length > 100 ? '...' : ''}`,
+      warnings: warnings.length > 0 ? warnings : undefined,
+    };
+  } catch (error) {
+    logger.error('Streaming contract generation failed', error);
+    
+    if (axios.isAxiosError(error)) {
+      const errorMessage = error.response?.data?.message || error.response?.data?.error || error.message;
+      return {
+        success: false,
+        error: `Smart Contract Generator API error: ${errorMessage}`,
+      };
+    }
+
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error during contract generation',
+    };
+  }
+}
+
+/**
+ * Get chat history for contract generation sessions
+ * Retrieves previous contract generation conversations for a given session
+ */
+export async function getContractGenerationHistory(options?: {
+  limit?: number;
+  offset?: number;
+  sortBy?: 'createdAt' | 'updatedAt';
+  sortOrder?: 'asc' | 'desc';
+}): Promise<{
+  success: boolean;
+  history?: Array<{ user: string; bot: string; createdAt: string }>;
+  error?: string;
+}> {
+  const apiKey = process.env.CHAINGPT_API_KEY;
+  
+  if (!apiKey) {
+    throw new ExternalApiError('ChainGPT', 'API key not configured');
+  }
+
+  try {
+    const response = await axios.get(SMART_CONTRACT_GENERATOR_API_URL, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      params: {
+        limit: options?.limit || 10,
+        offset: options?.offset || 0,
+        sortBy: options?.sortBy || 'createdAt',
+        sortOrder: options?.sortOrder || 'desc',
+      },
+    });
+
+    return {
+      success: true,
+      history: response.data.data?.rows || [],
+    };
+  } catch (error) {
+    logger.error('Failed to get contract generation history', error);
+    
+    if (axios.isAxiosError(error)) {
+      return {
+        success: false,
+        error: error.response?.data?.message || error.message,
+      };
+    }
+
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
     };
   }
 }

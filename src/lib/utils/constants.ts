@@ -88,6 +88,7 @@ export const TOKENS = {
     LINK: '0x84b9B910527Ad5C03A9Ca831909E21e236EA7b06', // Chainlink testnet
     CAKE: '0xFa60D973F7642B748046464e165A65B7323b0DEE', // PancakeSwap testnet
     DAI: '0x8a9424745056Eb399FD19a0EC26A14316684e274', // DAI testnet
+    ETH: '0xd66c6B4F0be8CE5b39D52E0Fd1344c389929B378', // Binance-Peg Ethereum testnet
   },
   mainnet: {
     WBNB: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
@@ -116,7 +117,7 @@ export const TOKEN_SYMBOLS: Record<string, Record<NetworkType, string>> = {
   LINK: { testnet: TOKENS.testnet.LINK, mainnet: TOKENS.mainnet.LINK },
   CAKE: { testnet: TOKENS.testnet.CAKE, mainnet: TOKENS.mainnet.CAKE },
   DAI: { testnet: TOKENS.testnet.DAI, mainnet: TOKENS.mainnet.DAI },
-  ETH: { testnet: '', mainnet: TOKENS.mainnet.ETH }, // ETH only on mainnet
+  ETH: { testnet: TOKENS.testnet.ETH, mainnet: TOKENS.mainnet.ETH },
   BTCB: { testnet: '', mainnet: TOKENS.mainnet.BTCB },
   XRP: { testnet: '', mainnet: TOKENS.mainnet.XRP },
   DOGE: { testnet: '', mainnet: TOKENS.mainnet.DOGE },
@@ -221,5 +222,19 @@ export const BATCH_OPERATION_TYPES = {
   TRANSFER: 0,
   SWAP: 1,
   CALL: 2,
+} as const;
+
+// BscScan API configuration
+export const BSCSCAN_API = {
+  testnet: {
+    baseUrl: 'https://api-testnet.bscscan.com/api',
+    explorerUrl: 'https://testnet.bscscan.com',
+  },
+  mainnet: {
+    baseUrl: 'https://api.bscscan.com/api',
+    explorerUrl: 'https://bscscan.com',
+  },
+  // API key from environment variable
+  apiKey: process.env.BSCSCAN_API_KEY || '',
 } as const;
 

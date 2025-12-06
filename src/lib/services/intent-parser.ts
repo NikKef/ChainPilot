@@ -244,6 +244,38 @@ export class IntentParser {
   private postProcess(result: ContextExtractionResult): ContextExtractionResult {
     const { intent } = result;
 
+    // CRITICAL FIX: Handle misclassified swap intents where "to" was set instead of "tokenOutSymbol"
+    // This happens when ChainGPT parses "swap BNB to ETH" and puts "ETH" in a "to" field
+    if (intent.type === 'swap' && 'to' in intent) {
+      const swapIntent = intent as SwapIntent & { to?: string };
+      const toValue = swapIntent.to;
+      
+      // If "to" is not a valid address but looks like a token symbol, it's actually tokenOutSymbol
+      if (toValue && !isValidAddress(toValue) && /^[A-Za-z]{2,10}$/.test(toValue)) {
+        logger.debug('Fixing misclassified swap intent - moving "to" to tokenOutSymbol', { 
+          originalTo: toValue 
+        });
+        
+        // Move to tokenOutSymbol if not already set
+        if (!swapIntent.tokenOutSymbol) {
+          swapIntent.tokenOutSymbol = toValue.toUpperCase();
+        }
+        
+        // Remove the invalid "to" field from swap intent
+        delete swapIntent.to;
+        
+        // Also remove from missingFields if it was marked as invalid
+        const toIndex = result.missingFields.indexOf('to');
+        if (toIndex > -1) {
+          result.missingFields.splice(toIndex, 1);
+        }
+        
+        // Remove any question about invalid address
+        result.questions = result.questions.filter(q => !q.includes('invalid'));
+        result.requiresFollowUp = result.missingFields.length > 0;
+      }
+    }
+
     // Resolve token symbols to addresses ONLY if address is not already set
     if ('tokenSymbol' in intent && intent.tokenSymbol) {
       const transferIntent = intent as TransferIntent;

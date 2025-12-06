@@ -63,3 +63,10 @@ export {
   buildSwap,
 } from './swaps';
 
+// Contract Source
+export {
+  fetchContractSource,
+  isContractVerified,
+  type ContractSourceResult,
+} from './contract-source';
+

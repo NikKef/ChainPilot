@@ -56,6 +56,7 @@ export interface AuditContractIntent extends BaseIntent {
   type: 'audit_contract';
   address?: string;
   sourceCode?: string;
+  chain?: string; // Explicit chain name (e.g., 'BNB Smart Chain', 'Ethereum', 'BSC Mainnet')
 }
 
 /**

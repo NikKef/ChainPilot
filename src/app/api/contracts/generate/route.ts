@@ -5,11 +5,19 @@ import { formatErrorResponse, getErrorStatusCode, ValidationError } from '@/lib/
 import { validateContractSpec, isValidNetwork } from '@/lib/utils/validation';
 import { logger } from '@/lib/utils';
 
+// Extended request type with optional generation options
+interface ExtendedGenerateContractRequest extends GenerateContractRequest {
+  contractType?: string;
+  features?: string[];
+  optimize?: boolean;
+  enableChatHistory?: boolean; // Enable session-based chat history for iterative refinement
+}
+
 export async function POST(request: NextRequest) {
   const startTime = Date.now();
 
   try {
-    const body: GenerateContractRequest = await request.json();
+    const body: ExtendedGenerateContractRequest = await request.json();
 
     // Validate input
     const validation = validateContractSpec(body.specText);
@@ -27,11 +35,20 @@ export async function POST(request: NextRequest) {
 
     logger.apiRequest('POST', '/api/contracts/generate', { 
       sessionId: body.sessionId,
-      specLength: body.specText.length 
+      specLength: body.specText.length,
+      contractType: body.contractType,
+      enableChatHistory: body.enableChatHistory,
     });
 
-    // Generate contract
-    const result = await generateContract(body.specText);
+    // Generate contract using the Smart Contract Generator API
+    // Pass session ID as sdkUniqueId for iterative refinement when chat history is enabled
+    const result = await generateContract(body.specText, {
+      contractType: body.contractType,
+      features: body.features,
+      optimize: body.optimize,
+      chatHistory: body.enableChatHistory ? 'on' : 'off',
+      sdkUniqueId: body.enableChatHistory ? body.sessionId : undefined,
+    });
 
     if (!result.success || !result.sourceCode) {
       const response: GenerateContractResponse = {

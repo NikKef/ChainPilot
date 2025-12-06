@@ -22,7 +22,12 @@ import {
   askWeb3Question,
   resetGeneralChatClient,
 } from './web3-llm';
-import { generateContract, generateContractTemplate } from './generator';
+import { 
+  generateContract, 
+  generateContractTemplate, 
+  streamContractGeneration,
+  getContractGenerationHistory,
+} from './generator';
 import { auditContract, quickSecurityCheck } from './auditor';
 
 export {
@@ -39,6 +44,8 @@ export {
   // Contract Generation
   generateContract,
   generateContractTemplate,
+  streamContractGeneration,
+  getContractGenerationHistory,
   
   // Auditing
   auditContract,
@@ -361,31 +368,54 @@ function fallbackExtraction(
     };
   }
 
-  // Swap pattern: "swap X TOKEN for TOKEN"
-  const swapMatch = message.match(
-    /swap\s+(\d+\.?\d*)?\s*(\w+)?\s*(?:for|to)\s+(\w+)?/i
-  );
-  if (swapMatch) {
-    const [, amount, tokenInSymbol, tokenOutSymbol] = swapMatch;
-    const intent = {
-      type: 'swap' as const,
-      amount,
-      tokenInSymbol: tokenInSymbol?.toUpperCase(),
-      tokenOutSymbol: tokenOutSymbol?.toUpperCase(),
-      network: context.network,
-    };
-    const missingFields = [];
-    if (!amount) missingFields.push('amount');
-    if (!tokenInSymbol) missingFields.push('tokenIn');
-    if (!tokenOutSymbol) missingFields.push('tokenOut');
-    
-    return {
-      intent,
-      missingFields,
-      questions: generateFollowUpQuestions('swap', missingFields),
-      requiresFollowUp: missingFields.length > 0,
-      confidence: 0.6,
-    };
+  // Swap pattern: "swap X TOKEN for/to/into TOKEN" - handles various phrasings
+  // Examples: "swap 0.1 BNB for ETH", "swap BNB to USDT", "convert 5 LINK into BNB"
+  const swapPatterns = [
+    // "swap/exchange/convert X TOKEN for/to/into TOKEN"
+    /(?:swap|exchange|convert|trade)\s+(\d+\.?\d*)?\s*(\w+)\s+(?:for|to|into)\s+(\w+)/i,
+    // "swap/exchange TOKEN to TOKEN" (no amount)
+    /(?:swap|exchange|convert|trade)\s+(\w+)\s+(?:for|to|into)\s+(\w+)/i,
+  ];
+  
+  for (const pattern of swapPatterns) {
+    const swapMatch = message.match(pattern);
+    if (swapMatch) {
+      let amount: string | undefined;
+      let tokenInSymbol: string | undefined;
+      let tokenOutSymbol: string | undefined;
+      
+      // Check if first capture group is a number (amount) or token symbol
+      if (swapMatch[1] && /^\d+\.?\d*$/.test(swapMatch[1])) {
+        // Pattern with amount: groups are [amount, tokenIn, tokenOut]
+        amount = swapMatch[1];
+        tokenInSymbol = swapMatch[2]?.toUpperCase();
+        tokenOutSymbol = swapMatch[3]?.toUpperCase();
+      } else {
+        // Pattern without amount: groups are [tokenIn, tokenOut]
+        tokenInSymbol = swapMatch[1]?.toUpperCase();
+        tokenOutSymbol = swapMatch[2]?.toUpperCase();
+      }
+      
+      const intent = {
+        type: 'swap' as const,
+        amount,
+        tokenInSymbol,
+        tokenOutSymbol,
+        network: context.network,
+      };
+      const missingFields = [];
+      if (!amount) missingFields.push('amount');
+      if (!tokenInSymbol) missingFields.push('tokenIn');
+      if (!tokenOutSymbol) missingFields.push('tokenOut');
+      
+      return {
+        intent,
+        missingFields,
+        questions: generateFollowUpQuestions('swap', missingFields),
+        requiresFollowUp: missingFields.length > 0,
+        confidence: 0.7,
+      };
+    }
   }
 
   // Audit pattern
@@ -497,10 +527,24 @@ export class ChainGPTService {
   }
 
   /**
-   * Generate a smart contract
+   * Generate a smart contract using the Smart Contract Generator API
    */
   async generateContract(spec: string, options?: Parameters<typeof generateContract>[1]) {
     return generateContract(spec, options);
+  }
+
+  /**
+   * Stream smart contract generation for real-time feedback
+   */
+  streamContractGeneration(spec: string, options?: Parameters<typeof streamContractGeneration>[1]) {
+    return streamContractGeneration(spec, options);
+  }
+
+  /**
+   * Get contract generation history
+   */
+  async getContractGenerationHistory(options?: Parameters<typeof getContractGenerationHistory>[0]) {
+    return getContractGenerationHistory(options);
   }
 
   /**
@@ -512,34 +556,49 @@ export class ChainGPTService {
 
   /**
    * Research a Web3 topic
+   * @param query The research query
+   * @param topics Optional topics to consider
+   * @param conversationId Optional conversation ID for follow-up context
    */
-  async researchTopic(query: string, topics?: string[]) {
-    return researchTopic(query, topics);
+  async researchTopic(query: string, topics?: string[], conversationId?: string) {
+    return researchTopic(query, topics, conversationId);
   }
 
   /**
    * Explain a contract
+   * @param address Contract address to explain
+   * @param network The network ('testnet' or 'mainnet')
+   * @param sourceCode Optional contract source code
+   * @param conversationId Optional conversation ID for follow-up context
    */
-  async explainContract(address: string, network: 'testnet' | 'mainnet', sourceCode?: string) {
-    return explainContract(address, network, sourceCode);
+  async explainContract(address: string, network: 'testnet' | 'mainnet', sourceCode?: string, conversationId?: string) {
+    return explainContract(address, network, sourceCode, conversationId);
   }
 
   /**
    * Explain a DeFi strategy
+   * @param strategyDescription Description of the strategy to analyze
+   * @param protocols Optional list of protocols involved
+   * @param conversationId Optional conversation ID for follow-up context
    */
-  async explainStrategy(strategyDescription: string, protocols?: string[]) {
-    return explainStrategy(strategyDescription, protocols);
+  async explainStrategy(strategyDescription: string, protocols?: string[], conversationId?: string) {
+    return explainStrategy(strategyDescription, protocols, conversationId);
   }
 
   /**
    * Get crypto insights
+   * @param topic The topic to get insights about
+   * @param network The network context ('testnet' or 'mainnet')
+   * @param conversationId Optional conversation ID for follow-up context
    */
-  async getCryptoInsights(topic: string, network?: 'testnet' | 'mainnet') {
-    return getCryptoInsights(topic, network);
+  async getCryptoInsights(topic: string, network?: 'testnet' | 'mainnet', conversationId?: string) {
+    return getCryptoInsights(topic, network, conversationId);
   }
 
   /**
    * Ask a general Web3 question
+   * @param question The question to ask
+   * @param context Optional context including conversationId for follow-up support
    */
   async askWeb3Question(question: string, context?: Parameters<typeof askWeb3Question>[1]) {
     return askWeb3Question(question, context);

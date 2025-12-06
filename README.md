@@ -1,6 +1,6 @@
 # ChainPilot - AI-Powered Web3 Copilot for BNB Chain
 
-ChainPilot is a chat-based Web3 copilot that enables users to interact with the BNB Chain through natural language. Research protocols, generate smart contracts, audit code, and execute on-chain actions — all through conversation.
+ChainPilot is a chat-based Web3 copilot that enables users to interact with the BNB Chain & BNB Chain Testnet through natural language. Research protocols, generate smart contracts, audit code, and execute on-chain actions — all through conversation.
 
 <p align="center">
   <img src="assets/ChainPilotLogo-min.png" width="350">
@@ -8,7 +8,11 @@ ChainPilot is a chat-based Web3 copilot that enables users to interact with the 
 
 ## Overview
 
-**Target User:** Retail DeFi enthusiasts who want to manage their on-chain activities more efficiently using AI assistance.
+**Target User:**
+ - DeFi enthusiasts who want to manage their on-chain activities more efficiently using AI assistance
+ - New DeFi users who do not have experience using dApps
+ - Founders looking to easily deploy their own tokens with no need to code smart contracts themselves
+ - DAOs and Treasury Managers looking to manage their funds in a safe democratic way while enforcing a specific policy.
 
 **Key Features:**
 - Natural language chat interface for Web3 interactions
@@ -17,7 +21,7 @@ ChainPilot is a chat-based Web3 copilot that enables users to interact with the 
 - Token swaps via PancakeSwap integration
 - Native and BEP20 token transfers
 - Policy-based transaction protection (spend caps, allow/deny lists)
-- One-click execution via Q402 sign-to-pay
+- One-click execution via Q402 sign-to-pay (where possible)
 
 ## Tech Stack
 
@@ -28,16 +32,25 @@ ChainPilot is a chat-based Web3 copilot that enables users to interact with the 
 - **DEX:** PancakeSwap V2/V3 Router
 - **Execution:** Q402 sign-to-pay protocol
 
-## ChainGPT + Quack Components Used
+## ⚙️ Key Integrations
 
 ### ChainGPT Integration
-1. **Web3 LLM** - Natural language understanding and context extraction for intent parsing
-2. **Smart Contract Generator** - Generate Solidity contracts from natural language specifications
-3. **Smart Contract Auditor** - Automated security analysis with risk scoring
+1. **Web3 LLM**
+ - Natural language understanding and context extraction for intent parsing.
+ - Used in `src/lib/services/chaingpt/web3-llm.ts` to process natural language, understand DeFi intent, and explain concepts to the user.
+2. **Smart Contract Generator** 
+ - Generate Solidity contracts from natural language specifications
+ - Integrated in `src/lib/services/chaingpt/generator.ts`
+3. **Smart Contract Auditor**
+ - Automated security analysis with risk scoring
+ - Integrated in `src/lib/services/chaingpt/auditor.ts` to analyze contracts for vulnerabilities (reentrancy, overflow, etc.) before the user interacts with them.
 
 ### Quack Q402 Integration
+We use Quack's infrastructure to handle the "Action" layer securely:
 - **Sign-to-pay execution** - Gasless transaction execution with signature-based approval
 - **Transaction batching** - Execute multiple operations atomically
+- **Policy Engine**: The agent checks transactions against `src/lib/services/policy` (Spend Caps, Allow/Deny Lists) before they are sent to the user for signature.
+- **Gas Sponsorship**: Transactions are routed through the Quack execution layer, abstracting gas complexities.
 
 ## Project Structure
 
@@ -111,14 +124,38 @@ Edit `.env.local` with your credentials.
 
 4. Set up the database:
    - Go to your Supabase project
-   - Run the migration in `supabase/migrations/001_initial_schema.sql`
+   - Run the migration sin `supabase/migrations/`
 
-5. Start the development server:
+5. Deploy Contracts (BNB Testnet)
+Deploy the Quack Vault and Executors:
+```bash
+npx hardhat run scripts/deploy-q402.js --network bscTestnet
+```
+*Make sure to update src/lib/utils/constants.ts with the new contract addresses if they change.*
+
+
+6. Start the development server:
 ```bash
 npm run dev
 ```
 
-6. Open [http://localhost:3000](http://localhost:3000)
+7. Open [http://localhost:3000](http://localhost:3000)
+
+## How to Demo
+1. Connect Wallet: Click "Connect Wallet" (top right) and switch to BNB Chain Testnet.
+
+2. Set Policies: Go to Settings, customise your policy according to your needs.
+
+3. Research: Ask the chat: "Explain how Uniswap v3 liquidity works." (Uses ChainGPT).
+
+4. Generate Contract: Ask: "Write a simple ERC20 token contract called PilotToken."
+
+5. Audit: Copy the generated code (or an existing address) and ask: "Audit this contract for me."
+
+6. Execute (Sign-to-Pay):
+- Ask: "Swap 0.01 BNB for USDT."
+- Review the Risk Panel and Transaction Preview.
+- Click Approve & Execute. Note that Quack handles the execution flow.
 
 ## Usage Examples
 
@@ -164,30 +201,16 @@ npm run dev
 - Slippage limits
 - Risk level assessment
 
-## Demo Flows
-
-### Flow 1: Research + Swap
-1. "What's the best token to buy on BNB right now?"
-2. ChainGPT provides analysis
-3. "Swap 10 USDT for WBNB"
-4. Preview shown with risk assessment
-5. User confirms, transaction executes
-
-### Flow 2: Contract Generation + Audit + Deploy
-1. "Create an NFT collection contract with max 10000 supply"
-2. Contract generated and auto-audited
-3. Risk findings displayed
-4. User reviews and deploys
-
-### Flow 3: Policy Protection
-1. User sets daily limit to $100
-2. "Send 200 USDT to 0x..."
-3. Transaction blocked by policy
-4. Clear explanation provided
+## Deployed Smart Contracts (BNB Testnet)
+Q402 Verifier = 0xe109A69825d8D8a15776788d34fA1FB49ED115De
+Q402 Implementation = 0xe109A69825d8D8a15776788d34fA1FB49ED115De
+Batch Executor = 0x61d2dd9121963Ab7be95befDb74Aad4C030C6186
+Q402 Vault = Q402_VAULT_TESTNET=0x30D282A8a5046e46Eb7Ad4174Fa851B1624ed8D2
+*These are the only official ChainPilot facilitator smart contracts.*
 
 ## License
 
-No License. © 2025 Nikolas Kefalonitis. All rights reserved.
+© 2025 Nikolas Kefalonitis. All rights reserved.
 
 ## Acknowledgments
 

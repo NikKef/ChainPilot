@@ -37,6 +37,8 @@ interface ChatOptions {
   chatHistory?: 'on' | 'off';
   useCustomContext?: boolean;
   contextInjection?: Record<string, string>;
+  /** Unique identifier for the conversation - enables follow-up questions with context */
+  sdkUniqueId?: string;
 }
 
 /**
@@ -108,11 +110,13 @@ export async function callWeb3LLM(
     }
 
     // Use createChatBlob for non-streaming response
+    // When sdkUniqueId is provided and chatHistory is 'on', the API maintains conversation context
     const response = await client.createChatBlob({
       question: fullQuestion,
       chatHistory: options?.chatHistory || 'off',
       useCustomContext: options?.useCustomContext || false,
       contextInjection: options?.contextInjection || {},
+      ...(options?.sdkUniqueId && { sdkUniqueId: options.sdkUniqueId }),
     });
 
     // Log the raw response for debugging
@@ -171,6 +175,7 @@ export async function* streamWeb3LLM(
       chatHistory: options?.chatHistory || 'off',
       useCustomContext: options?.useCustomContext || false,
       contextInjection: options?.contextInjection || {},
+      ...(options?.sdkUniqueId && { sdkUniqueId: options.sdkUniqueId }),
     });
 
     // Handle the stream
@@ -191,10 +196,14 @@ export async function* streamWeb3LLM(
 
 /**
  * Research Web3 topics using ChainGPT
+ * @param query The research query
+ * @param topics Optional topics to consider
+ * @param conversationId Optional conversation ID for follow-up context - enables the AI to remember previous questions
  */
 export async function researchTopic(
   query: string,
-  topics?: string[]
+  topics?: string[],
+  conversationId?: string
 ): Promise<{
   answer: string;
   relatedTopics?: string[];
@@ -215,7 +224,12 @@ Please provide a comprehensive but concise answer. Include:
 3. Practical examples if relevant
 4. Suggest related topics they might want to explore`;
 
-  const answer = await callWeb3LLM(prompt, { systemPrompt });
+  // When conversationId is provided, enable chat history to maintain context for follow-up questions
+  const answer = await callWeb3LLM(prompt, { 
+    systemPrompt,
+    chatHistory: conversationId ? 'on' : 'off',
+    sdkUniqueId: conversationId,
+  });
 
   return {
     answer,
@@ -225,11 +239,16 @@ Please provide a comprehensive but concise answer. Include:
 
 /**
  * Explain a contract or token
+ * @param address Contract address to explain
+ * @param network The network ('testnet' or 'mainnet')
+ * @param sourceCode Optional contract source code
+ * @param conversationId Optional conversation ID for follow-up context
  */
 export async function explainContract(
   address: string,
   network: 'testnet' | 'mainnet',
-  sourceCode?: string
+  sourceCode?: string,
+  conversationId?: string
 ): Promise<{
   explanation: string;
   riskHints: string[];
@@ -253,7 +272,12 @@ Please provide:
 
 Format your response in clear markdown.`;
 
-  const explanation = await callWeb3LLM(prompt, { systemPrompt });
+  // When conversationId is provided, enable chat history to maintain context for follow-up questions
+  const explanation = await callWeb3LLM(prompt, { 
+    systemPrompt,
+    chatHistory: conversationId ? 'on' : 'off',
+    sdkUniqueId: conversationId,
+  });
 
   // Extract risk hints from the explanation
   const riskHints: string[] = [];
@@ -295,10 +319,14 @@ Format your response in clear markdown.`;
 
 /**
  * Explain a DeFi strategy
+ * @param strategyDescription Description of the strategy to analyze
+ * @param protocols Optional list of protocols involved
+ * @param conversationId Optional conversation ID for follow-up context
  */
 export async function explainStrategy(
   strategyDescription: string,
-  protocols?: string[]
+  protocols?: string[],
+  conversationId?: string
 ): Promise<string> {
   const protocolContext = protocols?.length
     ? `\n\nProtocols involved: ${protocols.join(', ')}`
@@ -319,15 +347,23 @@ Please provide:
 4. **Gas Costs**: Estimated transaction costs
 5. **Recommendation**: Is this strategy advisable? For what type of user?`;
 
-  return callWeb3LLM(prompt, { systemPrompt });
+  return callWeb3LLM(prompt, { 
+    systemPrompt,
+    chatHistory: conversationId ? 'on' : 'off',
+    sdkUniqueId: conversationId,
+  });
 }
 
 /**
  * Get crypto news and analysis
+ * @param topic The topic to get insights about
+ * @param network The network context ('testnet' or 'mainnet')
+ * @param conversationId Optional conversation ID for follow-up context
  */
 export async function getCryptoInsights(
   topic: string,
-  network: 'testnet' | 'mainnet' = 'mainnet'
+  network: 'testnet' | 'mainnet' = 'mainnet',
+  conversationId?: string
 ): Promise<string> {
   const systemPrompt = `${WEB3_LLM_SYSTEM_PROMPT}
 
@@ -344,11 +380,17 @@ Focus on:
 
 Note: This is for ${network === 'testnet' ? 'testnet/development' : 'mainnet/production'} context.`;
 
-  return callWeb3LLM(prompt, { systemPrompt });
+  return callWeb3LLM(prompt, { 
+    systemPrompt,
+    chatHistory: conversationId ? 'on' : 'off',
+    sdkUniqueId: conversationId,
+  });
 }
 
 /**
  * Ask a general Web3 question
+ * @param question The question to ask
+ * @param context Optional context including network, address, previous messages, and conversationId
  */
 export async function askWeb3Question(
   question: string,
@@ -356,6 +398,7 @@ export async function askWeb3Question(
     network?: 'testnet' | 'mainnet';
     relatedAddress?: string;
     previousMessages?: Array<{ role: 'user' | 'assistant'; content: string }>;
+    conversationId?: string;
   }
 ): Promise<string> {
   let systemPrompt = WEB3_LLM_SYSTEM_PROMPT;
@@ -368,9 +411,10 @@ export async function askWeb3Question(
     systemPrompt += `\n\nRelated address being discussed: ${context.relatedAddress}`;
   }
 
-  // Include conversation context if available
+  // Include conversation context if available (for local context backup)
+  // Note: When conversationId is provided with chatHistory: 'on', the API maintains its own context
   let fullQuestion = question;
-  if (context?.previousMessages?.length) {
+  if (context?.previousMessages?.length && !context?.conversationId) {
     const conversationContext = context.previousMessages
       .slice(-3) // Last 3 messages for context
       .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
@@ -378,5 +422,9 @@ export async function askWeb3Question(
     fullQuestion = `Previous conversation:\n${conversationContext}\n\nNew question: ${question}`;
   }
 
-  return callWeb3LLM(fullQuestion, { systemPrompt });
+  return callWeb3LLM(fullQuestion, { 
+    systemPrompt,
+    chatHistory: context?.conversationId ? 'on' : 'off',
+    sdkUniqueId: context?.conversationId,
+  });
 }

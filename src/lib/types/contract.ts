@@ -172,6 +172,7 @@ export interface AuditResult {
   minorFindings: AuditFinding[];
   recommendations: string[];
   error?: string;
+  rawResponse?: string; // The raw response from ChainGPT
 }
 
 /**

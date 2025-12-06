@@ -23,14 +23,16 @@ ChainPilot is a chat-based Web3 copilot that enables users to interact with the 
 - Policy-based transaction protection (spend caps, allow/deny lists)
 - One-click execution via Q402 sign-to-pay (where possible)
 
-## Tech Stack
+## Tech Stack Architecture
 
-- **Frontend:** Next.js 14 (App Router), React, TypeScript, Tailwind CSS, Framer Motion
+- **Frontend:** Next.js 14 (App Router), React, TypeScript, Tailwind CSS, Shadcn UI, Framer Motion
 - **Backend:** Next.js API Routes, Supabase (PostgreSQL)
-- **AI:** ChainGPT SDK (Web3 LLM, Contract Generator, Auditor)
-- **Blockchain:** ethers.js v6, BNB Chain (testnet/mainnet)
+- **Database:** Supabase (PostgreSQL)
+- **AI:** ChainGPT API (Web3 LLM, Contract Generator, Auditor)
+- **Blockchain:** Ethers.js v6, BNB Chain (testnet/mainnet), Hardhat
 - **DEX:** PancakeSwap V2/V3 Router
-- **Execution:** Q402 sign-to-pay protocol
+- **Execution/Facilitator:** Q402 sign-to-pay protocol with Custom Smart Contracts
+
 
 ## ⚙️ Key Integrations
 

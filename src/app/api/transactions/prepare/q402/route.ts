@@ -1,5 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createTransactionExecutor } from '@/lib/services/q402';
+import { createPolicyEngine } from '@/lib/services/policy';
+import { applyTokenPolicy } from '@/lib/services/policy/enforcer';
+import { getPolicyForSession } from '@/lib/services/policy/server';
 import type { PrepareQ402Request, PrepareQ402Response } from '@/lib/types';
 import { formatErrorResponse, getErrorStatusCode, ValidationError } from '@/lib/utils/errors';
 import { logger } from '@/lib/utils';
@@ -47,16 +50,46 @@ export async function POST(request: NextRequest) {
     });
 
     const network: NetworkType = body.preview.network;
+    const policy = await getPolicyForSession(body.sessionId);
+    const policyEngine = createPolicyEngine(policy, network);
+
+    const baseDecision = await policyEngine.evaluate(
+      body.preview.type,
+      {
+        tokenAddress: body.preview.tokenAddress || body.preview.tokenInAddress || undefined,
+        targetAddress: body.preview.contractAddress || body.preview.to,
+        slippageBps: body.preview.slippageBps,
+      },
+      0,
+      body.signerAddress
+    );
+
+    const policyDecision = applyTokenPolicy(baseDecision, policy, [
+      body.preview.tokenAddress,
+      body.preview.tokenInAddress,
+      body.preview.tokenOutAddress,
+    ]);
+
+    if (!policyDecision.allowed) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: policyDecision.reasons.join('; '),
+          policyDecision,
+        },
+        { status: 403 }
+      );
+    }
     
     // Create transaction executor
     const executor = createTransactionExecutor(network);
 
     // Convert PolicyEvaluationResult to PolicyDecision format
-    const policyDecision = {
-      allowed: body.policyDecision.allowed,
-      riskLevel: body.policyDecision.riskLevel,
-      reasons: body.policyDecision.reasons,
-      warnings: body.policyDecision.warnings?.map(w => typeof w === 'string' ? w : w.message),
+    const policyDecisionForExecutor = {
+      allowed: policyDecision.allowed,
+      riskLevel: policyDecision.riskLevel,
+      reasons: policyDecision.reasons,
+      warnings: policyDecision.warnings.map(w => w.message),
     };
 
     // Prepare for Q402 execution
@@ -65,7 +98,7 @@ export async function POST(request: NextRequest) {
       body.preview.preparedTx,
       body.preview.type,
       `${body.preview.type}: ${body.preview.tokenAmount || body.preview.nativeValue} ${body.preview.tokenSymbol || 'BNB'}`,
-      policyDecision,
+      policyDecisionForExecutor,
       {
         valueUsd: body.preview.valueUsd ? parseFloat(body.preview.valueUsd) : undefined,
         ownerAddress: body.signerAddress,

@@ -264,6 +264,8 @@ export interface BatchOperation {
   formattedAmountIn?: string;
   /** Formatted output amount (e.g., "0.025") */
   formattedAmountOut?: string;
+  /** Slippage (bps) used when building the swap operation */
+  slippageBps?: number;
 }
 
 /**

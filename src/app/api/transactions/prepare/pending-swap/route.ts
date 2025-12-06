@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getPendingSwap, deletePendingSwap, createTransactionExecutor } from '@/lib/services/q402';
 import { buildSwap, createTransactionPreview, getTokenInfo } from '@/lib/services/web3';
+import { createPolicyEngine } from '@/lib/services/policy';
+import { applyTokenPolicy } from '@/lib/services/policy/enforcer';
+import { getPolicyForSession } from '@/lib/services/policy/server';
 import { formatErrorResponse, getErrorStatusCode, ValidationError } from '@/lib/utils/errors';
 import { logger } from '@/lib/utils';
 import { type NetworkType, PANCAKE_ROUTER } from '@/lib/utils/constants';
@@ -82,6 +85,8 @@ export async function POST(request: NextRequest) {
         from: pendingSwap.walletAddress,
         network,
         amount: pendingSwap.amount,
+        tokenInAddress: pendingSwap.tokenIn,
+        tokenOutAddress: pendingSwap.tokenOut,
         tokenInSymbol: tokenInInfo.symbol || pendingSwap.tokenInSymbol,
         tokenOutSymbol: tokenOutInfo.symbol || pendingSwap.tokenOutSymbol,
         tokenOutAmount: formattedOutput,
@@ -92,6 +97,31 @@ export async function POST(request: NextRequest) {
     // Prepare Q402 request for gas-sponsored execution
     const executor = createTransactionExecutor(network);
     const routerAddress = PANCAKE_ROUTER[network];
+
+    const policy = await getPolicyForSession(sessionId);
+    const policyEngine = createPolicyEngine(policy, network);
+    const policyDecision = applyTokenPolicy(
+      await policyEngine.evaluate(
+        'swap',
+        { tokenAddress: pendingSwap.tokenIn, targetAddress: swapResult.preparedTx.to, slippageBps: pendingSwap.slippageBps },
+        0,
+        signerAddress
+      ),
+      policy,
+      [pendingSwap.tokenIn, pendingSwap.tokenOut]
+    );
+
+    if (!policyDecision.allowed) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: policyDecision.reasons.join('; '),
+          policyDecision,
+          preview,
+        },
+        { status: 403 }
+      );
+    }
     
     const preparation = await executor.prepareForExecution(
       swapResult.preparedTx,

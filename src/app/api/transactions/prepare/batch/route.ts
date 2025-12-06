@@ -2,11 +2,14 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createQ402Client, createQ402Service } from '@/lib/services/q402';
 import type { BatchOperation, BatchPaymentRequest, BatchSignedMessage } from '@/lib/services/q402/types';
 import { buildSwap, getSwapQuote, getTokenInfo } from '@/lib/services/web3';
-import { createPolicyEngine, getDefaultPolicy } from '@/lib/services/policy';
+import { createPolicyEngine } from '@/lib/services/policy';
+import { applyTokenPolicy } from '@/lib/services/policy/enforcer';
+import { getPolicyForSession } from '@/lib/services/policy/server';
 import { formatErrorResponse, getErrorStatusCode, ValidationError } from '@/lib/utils/errors';
 import { logger } from '@/lib/utils';
 import { type NetworkType, PANCAKE_ROUTER, TOKENS } from '@/lib/utils/constants';
 import { parseUnits, formatUnits, Interface } from 'ethers';
+import type { PolicyEvaluationResult, RiskLevel } from '@/lib/types';
 
 /**
  * Operation input from client
@@ -124,6 +127,44 @@ export async function POST(request: NextRequest) {
     const network: NetworkType = body.network;
     const client = createQ402Client(network);
     const routerAddress = PANCAKE_ROUTER[network];
+    const policy = await getPolicyForSession(body.sessionId);
+    const policyEngine = createPolicyEngine(policy, network);
+    const RISK_ORDER: Record<RiskLevel, number> = {
+      LOW: 0,
+      MEDIUM: 1,
+      HIGH: 2,
+      BLOCKED: 3,
+    };
+    const evaluateWithPolicy = async (
+      transactionType: string,
+      params: Parameters<typeof policyEngine.evaluate>[1] & { extraTokenAddresses?: Array<string | null | undefined> }
+    ) => {
+      const { extraTokenAddresses = [], ...policyParams } = params;
+      const decision = await policyEngine.evaluate(
+        transactionType,
+        policyParams,
+        0,
+        body.signerAddress
+      );
+      return applyTokenPolicy(decision, policy, [
+        policyParams.tokenAddress,
+        ...extraTokenAddresses,
+      ]);
+    };
+    const mergeDecisions = (decisions: PolicyEvaluationResult[]): PolicyEvaluationResult => {
+      const violations = decisions.flatMap(d => d.violations);
+      const warnings = decisions.flatMap(d => d.warnings);
+      const riskLevel = decisions.reduce<RiskLevel>(
+        (current, d) => (RISK_ORDER[d.riskLevel] > RISK_ORDER[current] ? d.riskLevel : current),
+        'LOW'
+      );
+      const allowed = !violations.some(v => v.severity === 'blocking');
+      const reasons = [
+        ...violations.map(v => v.message),
+        ...warnings.map(w => w.message),
+      ];
+      return { allowed, riskLevel, violations, warnings, reasons };
+    };
 
     // Check if BatchExecutor is deployed
     const batchExecutorAddress = client.getBatchExecutorAddress();
@@ -322,6 +363,7 @@ export async function POST(request: NextRequest) {
           tokenOutSymbol,
           formattedAmountIn: op.amount,
           formattedAmountOut,
+          slippageBps,
         });
 
         previewOperations.push({
@@ -362,6 +404,44 @@ export async function POST(request: NextRequest) {
           description: `Call ${op.methodName || 'contract function'}`,
         });
       }
+    }
+
+    const opPolicyDecisions = await Promise.all(
+      batchOperations.map(op => {
+        if (op.type === 'swap') {
+          return evaluateWithPolicy('swap', {
+            tokenAddress: op.tokenIn || undefined,
+            targetAddress: op.target,
+            slippageBps: (op as unknown as { slippageBps?: number }).slippageBps,
+            extraTokenAddresses: [op.tokenOut],
+          });
+        }
+
+        if (op.type === 'transfer') {
+          return evaluateWithPolicy('transfer', {
+            tokenAddress: op.tokenIn || undefined,
+            targetAddress: op.target,
+          });
+        }
+
+        // Default to contract call evaluation
+        return evaluateWithPolicy('contract_call', {
+          tokenAddress: op.tokenIn || undefined,
+          targetAddress: op.target,
+        });
+      })
+    );
+
+    const policyDecision = mergeDecisions(opPolicyDecisions);
+    if (!policyDecision.allowed) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: policyDecision.reasons.join('; '),
+          policyDecision,
+        },
+        { status: 403 }
+      );
     }
 
     // Check if any tokens need approval first

@@ -538,6 +538,8 @@ export async function createTransactionPreview(
     tokenSymbol?: string;
     tokenAddress?: string;
     amount?: string;
+    tokenInAddress?: string | null;
+    tokenOutAddress?: string | null;
     tokenInSymbol?: string;
     tokenOutSymbol?: string;
     tokenOutAmount?: string;
@@ -557,6 +559,8 @@ export async function createTransactionPreview(
     network: params.network,
     from: params.from,
     to: displayTo,
+    contractAddress: preparedTx.to,
+    recipient: params.recipient,
     preparedTx,
     estimatedGas: gasEstimate.gasLimit.toString(),
     estimatedGasPrice: gasEstimate.gasPrice.toString(),
@@ -576,6 +580,8 @@ export async function createTransactionPreview(
     preview.tokenInAmount = params.amount;
     preview.tokenOutSymbol = params.tokenOutSymbol;
     preview.tokenOutAmount = params.tokenOutAmount;
+    preview.tokenInAddress = params.tokenInAddress ?? null;
+    preview.tokenOutAddress = params.tokenOutAddress ?? null;
     preview.slippageBps = params.slippageBps;
   }
 

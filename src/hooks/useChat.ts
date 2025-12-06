@@ -406,6 +406,20 @@ export function useChat({
       return;
     }
 
+    if (!policyDecision.allowed) {
+      const reason = policyDecision.reasons?.join('; ') || 'Blocked by your security policy';
+      setMessages(prev => [...prev, {
+        id: `msg_${Date.now()}_policy_block`,
+        sessionId,
+        role: 'assistant',
+        content: `🚫 Transaction blocked by your security policy.\n\n${reason}`,
+        createdAt: new Date().toISOString(),
+      }]);
+      setPendingTransaction(null);
+      setPolicyDecision(null);
+      return;
+    }
+
     // Check if provider is available
     if (!provider) {
       console.log('[Chat] No provider available');

@@ -34,6 +34,8 @@ export interface TransactionPreview {
   network: NetworkType;
   from: string;
   to: string;
+  contractAddress?: string; // On-chain target (token/router/contract)
+  recipient?: string; // Human recipient when different from contractAddress
   
   // Value info
   nativeValue?: string;
@@ -42,6 +44,8 @@ export interface TransactionPreview {
   tokenAmountFormatted?: string;
   tokenSymbol?: string;
   tokenAddress?: string;
+  tokenInAddress?: string | null;
+  tokenOutAddress?: string | null;
   
   // For swaps
   tokenInSymbol?: string;

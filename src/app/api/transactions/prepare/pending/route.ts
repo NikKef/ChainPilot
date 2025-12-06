@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getPendingTransfer, deletePendingTransfer, createTransactionExecutor } from '@/lib/services/q402';
 import { buildTokenTransfer, createTransactionPreview, getTokenInfo } from '@/lib/services/web3';
+import { createPolicyEngine } from '@/lib/services/policy';
+import { applyTokenPolicy } from '@/lib/services/policy/enforcer';
+import { getPolicyForSession } from '@/lib/services/policy/server';
 import { formatErrorResponse, getErrorStatusCode, ValidationError } from '@/lib/utils/errors';
 import { logger } from '@/lib/utils';
 import { type NetworkType } from '@/lib/utils/constants';
@@ -79,6 +82,31 @@ export async function POST(request: NextRequest) {
     );
 
     // Prepare Q402 request
+    const policy = await getPolicyForSession(sessionId);
+    const policyEngine = createPolicyEngine(policy, network);
+    const policyDecision = applyTokenPolicy(
+      await policyEngine.evaluate(
+        'token_transfer',
+        { targetAddress: pendingTransfer.recipientAddress, tokenAddress: pendingTransfer.tokenAddress },
+        0,
+        signerAddress
+      ),
+      policy,
+      [pendingTransfer.tokenAddress]
+    );
+
+    if (!policyDecision.allowed) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: policyDecision.reasons.join('; '),
+          policyDecision,
+          preview,
+        },
+        { status: 403 }
+      );
+    }
+
     const executor = createTransactionExecutor(network);
     const preparation = await executor.prepareForExecution(
       transferTx,

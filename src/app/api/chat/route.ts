@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createIntentParser } from '@/lib/services/intent-parser';
 import { chainGPT, researchTopic, explainContract } from '@/lib/services/chaingpt';
-import { createPolicyEngine, getDefaultPolicy } from '@/lib/services/policy';
+import { createPolicyEngine } from '@/lib/services/policy';
+import { applyTokenPolicy } from '@/lib/services/policy/enforcer';
+import { getPolicyForSession } from '@/lib/services/policy/server';
 import { 
   buildNativeTransfer, 
   buildTokenTransfer, 
@@ -25,6 +27,8 @@ import {
   type BatchOperation,
   type TransactionPreview,
   type ChatMessage,
+  type PolicyEvaluationResult,
+  type RiskLevel,
 } from '@/lib/types';
 import { formatErrorResponse, getErrorStatusCode, ValidationError } from '@/lib/utils/errors';
 import { validateChatMessage, isValidNetwork } from '@/lib/utils/validation';
@@ -104,6 +108,58 @@ export async function POST(request: NextRequest) {
 
     const network: NetworkType = sessionData.current_network as NetworkType;
     const walletAddress = sessionData.wallet_address;
+
+    // Load the user's security policy (with lists) and build a shared evaluator
+    const policy = await getPolicyForSession(body.sessionId);
+    const policyEngine = createPolicyEngine(policy, network);
+    const RISK_ORDER: Record<RiskLevel, number> = {
+      LOW: 0,
+      MEDIUM: 1,
+      HIGH: 2,
+      BLOCKED: 3,
+    };
+
+    async function evaluateWithPolicy(
+      transactionType: string,
+      params: Parameters<typeof policyEngine.evaluate>[1] & {
+        extraTokenAddresses?: Array<string | null | undefined>;
+      }
+    ): Promise<PolicyEvaluationResult> {
+      const { extraTokenAddresses = [], ...policyParams } = params;
+      const baseDecision = await policyEngine.evaluate(
+        transactionType,
+        policyParams,
+        0,
+        walletAddress
+      );
+
+      return applyTokenPolicy(baseDecision, policy, [
+        policyParams.tokenAddress,
+        ...extraTokenAddresses,
+      ]);
+    }
+
+    function mergeDecisions(decisions: PolicyEvaluationResult[]): PolicyEvaluationResult {
+      const violations = decisions.flatMap(d => d.violations);
+      const warnings = decisions.flatMap(d => d.warnings);
+      const riskLevel = decisions.reduce<RiskLevel>(
+        (current, d) => (RISK_ORDER[d.riskLevel] > RISK_ORDER[current] ? d.riskLevel : current),
+        'LOW'
+      );
+      const allowed = !violations.some(v => v.severity === 'blocking');
+      const reasons = [
+        ...violations.map(v => v.message),
+        ...warnings.map(w => w.message),
+      ];
+
+      return {
+        allowed,
+        riskLevel,
+        violations,
+        warnings,
+        reasons,
+      };
+    }
 
     // Get or create conversation
     let conversationId = body.conversationId;
@@ -203,6 +259,8 @@ export async function POST(request: NextRequest) {
       walletAddress,
       body.sessionId,
       conversationId,
+      evaluateWithPolicy,
+      mergeDecisions,
       chatHistory
     );
 
@@ -255,6 +313,13 @@ async function buildResponse(
   walletAddress: string,
   sessionId: string,
   conversationId: string,
+  evaluateWithPolicy: (
+    transactionType: string,
+    params: Parameters<ReturnType<typeof createPolicyEngine>['evaluate']>[1] & {
+      extraTokenAddresses?: Array<string | null | undefined>;
+    }
+  ) => Promise<PolicyEvaluationResult>,
+  mergeDecisions: (decisions: PolicyEvaluationResult[]) => PolicyEvaluationResult,
   chatHistory?: { role: 'user' | 'assistant'; content: string }[]
 ): Promise<ChatResponse> {
   const { intent, missingFields, questions, requiresFollowUp, confidence } = extractionResult;
@@ -570,7 +635,7 @@ async function buildResponse(
       let tokenSymbol = transferIntent.tokenSymbol || 'BNB';
       
       // Validate tokenAddress is different from recipient (ChainGPT sometimes confuses them)
-      let effectiveTokenAddress = transferIntent.tokenAddress;
+      let effectiveTokenAddress: string | undefined = transferIntent.tokenAddress ?? undefined;
       if (effectiveTokenAddress && effectiveTokenAddress.toLowerCase() === transferIntent.to.toLowerCase()) {
         // Token address was incorrectly set to recipient address - clear it
         logger.debug('Clearing tokenAddress that matches recipient address', { 
@@ -652,13 +717,9 @@ async function buildResponse(
           );
           
           // Evaluate policy for approval
-          const policy = getDefaultPolicy(sessionId);
-          const policyEngine = createPolicyEngine(policy, network);
-          const approvalPolicyDecision = await policyEngine.evaluate(
+          const approvalPolicyDecision = await evaluateWithPolicy(
             'contract_call',
-            { targetAddress: effectiveTokenAddress },
-            0,
-            walletAddress
+            { targetAddress: effectiveTokenAddress, tokenAddress: effectiveTokenAddress }
           );
           
           const content = `Before transferring ${transferIntent.amount} ${tokenSymbol}, you need to approve the ChainPilot contract to spend your tokens.\n\n` +
@@ -776,13 +837,9 @@ async function buildResponse(
       );
 
       // Evaluate policy
-      const policy = getDefaultPolicy(sessionId);
-      const policyEngine = createPolicyEngine(policy, network);
-      const policyDecision = await policyEngine.evaluate(
+      const policyDecision = await evaluateWithPolicy(
         'transfer',
-        { targetAddress: transferIntent.to },
-        0,
-        walletAddress
+        { targetAddress: transferIntent.to, tokenAddress: effectiveTokenAddress }
       );
 
       const content = `Ready to transfer ${transferIntent.amount} ${tokenSymbol} to ${transferIntent.to.slice(0, 10)}...${transferIntent.to.slice(-8)}`;
@@ -840,6 +897,8 @@ async function buildResponse(
           walletAddress,
           sessionId,
           conversationId,
+          evaluateWithPolicy,
+          mergeDecisions,
           chatHistory
         );
       }
@@ -906,13 +965,9 @@ async function buildResponse(
           );
           
           // Evaluate policy for approval
-          const policy = getDefaultPolicy(sessionId);
-          const policyEngine = createPolicyEngine(policy, network);
-          const approvalPolicyDecision = await policyEngine.evaluate(
+          const approvalPolicyDecision = await evaluateWithPolicy(
             'contract_call',
-            { targetAddress: swapIntent.tokenIn },
-            0,
-            walletAddress
+            { targetAddress: swapIntent.tokenIn, tokenAddress: swapIntent.tokenIn }
           );
           
           // Generate a pending swap ID
@@ -1081,13 +1136,9 @@ async function buildResponse(
             }
           );
           
-          const policy = getDefaultPolicy(sessionId);
-          const policyEngine = createPolicyEngine(policy, network);
-          const approvalPolicyDecision = await policyEngine.evaluate(
+          const approvalPolicyDecision = await evaluateWithPolicy(
             'contract_call',
-            { targetAddress: swapIntent.tokenIn },
-            0,
-            walletAddress
+            { targetAddress: swapIntent.tokenIn, tokenAddress: swapIntent.tokenIn }
           );
           
           // Store pending swap for auto-follow-up after approval
@@ -1168,6 +1219,8 @@ async function buildResponse(
             from: walletAddress,
             network,
             amount: swapIntent.amount,
+            tokenInAddress: swapIntent.tokenIn,
+            tokenOutAddress: swapIntent.tokenOut || null,
             tokenInSymbol,
             tokenOutSymbol,
             tokenOutAmount: formattedOutput,
@@ -1175,13 +1228,14 @@ async function buildResponse(
           }
         );
 
-        const policy = getDefaultPolicy(sessionId);
-        const policyEngine = createPolicyEngine(policy, network);
-        const policyDecision = await policyEngine.evaluate(
+        const policyDecision = await evaluateWithPolicy(
           'swap',
-          { slippageBps },
-          0,
-          walletAddress
+          {
+            tokenAddress: swapIntent.tokenIn || undefined,
+            targetAddress: swapResult.preparedTx.to,
+            slippageBps,
+            extraTokenAddresses: [swapIntent.tokenOut],
+          }
         );
 
         // Gas-sponsored swap via BatchExecutor!
@@ -1232,6 +1286,8 @@ async function buildResponse(
           from: walletAddress,
           network,
           amount: swapIntent.amount,
+          tokenInAddress: swapIntent.tokenIn,
+          tokenOutAddress: swapIntent.tokenOut || null,
           tokenInSymbol,
           tokenOutSymbol,
           tokenOutAmount: formattedOutput,
@@ -1239,13 +1295,14 @@ async function buildResponse(
         }
       );
 
-      const policy = getDefaultPolicy(sessionId);
-      const policyEngine = createPolicyEngine(policy, network);
-      const policyDecision = await policyEngine.evaluate(
+      const policyDecision = await evaluateWithPolicy(
         'swap',
-        { slippageBps },
-        0,
-        walletAddress
+        {
+          tokenAddress: swapIntent.tokenIn || undefined,
+          targetAddress: swapResult.preparedTx.to,
+          slippageBps,
+          extraTokenAddresses: [swapIntent.tokenOut],
+        }
       );
 
       // Note: Native BNB swaps still require direct execution
@@ -1412,6 +1469,8 @@ async function buildResponse(
               from: walletAddress,
               network,
               amount: singleOp.amount,
+            tokenInAddress: singleOp.tokenIn,
+            tokenOutAddress: singleOp.tokenOut || null,
               tokenInSymbol: singleOp.tokenInSymbol,
               tokenOutSymbol: singleOp.tokenOutSymbol,
               tokenOutAmount: formattedOutput,
@@ -1419,14 +1478,15 @@ async function buildResponse(
             }
           );
 
-          const policy = getDefaultPolicy(sessionId);
-          const policyEngine = createPolicyEngine(policy, network);
-          const policyDecision = await policyEngine.evaluate(
-            'swap',
-            { slippageBps },
-            0,
-            walletAddress
-          );
+        const policyDecision = await evaluateWithPolicy(
+          'swap',
+          {
+            tokenAddress: singleOp.tokenIn || undefined,
+            targetAddress: swapResult.preparedTx.to,
+            slippageBps,
+            extraTokenAddresses: [singleOp.tokenOut],
+          }
+        );
 
           // Check BatchExecutor availability for gas-sponsored execution
           const batchExecutorAddress = Q402_CONTRACTS[network].batchExecutor;
@@ -1671,6 +1731,8 @@ async function buildResponse(
               from: walletAddress,
               network,
               amount: swapOp.amount,
+            tokenInAddress: swapOp.tokenIn || null,
+            tokenOutAddress: swapOp.tokenOut || null,
               tokenInSymbol: swapOp.tokenInSymbol,
               tokenOutSymbol: swapOp.tokenOutSymbol,
               tokenOutAmount: estimatedOutput,
@@ -1678,13 +1740,14 @@ async function buildResponse(
             }
           );
           
-          const policy = getDefaultPolicy(sessionId);
-          const policyEngine = createPolicyEngine(policy, network);
-          const policyDecision = await policyEngine.evaluate(
+          const policyDecision = await evaluateWithPolicy(
             'swap',
-            { slippageBps },
-            0,
-            walletAddress
+            {
+              tokenAddress: swapOp.tokenIn || undefined,
+              targetAddress: swapResult.preparedTx.to,
+              slippageBps,
+              extraTokenAddresses: [swapOp.tokenOut],
+            }
           );
           
           // Store the pending transfer info for follow-up
@@ -1808,14 +1871,27 @@ async function buildResponse(
           : `⚠️ Note: You will need to pay gas for this batch transaction.`) +
         '\n\n📝 Sign once to execute all operations.';
 
-      const policy = getDefaultPolicy(sessionId);
-      const policyEngine = createPolicyEngine(policy, network);
-      const policyDecision = await policyEngine.evaluate(
-        'batch',
-        {}, // Batch operations are evaluated individually
-        0,
-        walletAddress
-      );
+      const opDecisions: PolicyEvaluationResult[] = [];
+      for (const op of batchOps) {
+        if (op.type === 'swap') {
+          opDecisions.push(
+            await evaluateWithPolicy('swap', {
+              tokenAddress: op.tokenIn || undefined,
+              targetAddress: useBatchExecutor ? batchExecutorAddress : undefined,
+              slippageBps: op.slippageBps,
+              extraTokenAddresses: [op.tokenOut],
+            })
+          );
+        } else if (op.type === 'transfer') {
+          opDecisions.push(
+            await evaluateWithPolicy('transfer', {
+              targetAddress: op.recipient,
+              tokenAddress: op.tokenAddress || undefined,
+            })
+          );
+        }
+      }
+      const policyDecision = mergeDecisions(opDecisions);
 
       // Create a synthetic transaction preview for the batch
       // This is needed because the UI shows confirm button based on transactionPreview

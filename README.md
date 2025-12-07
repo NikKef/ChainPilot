@@ -34,8 +34,8 @@ ChainPilot is a chat-based Web3 copilot that enables users to interact with the 
 - **Execution/Facilitator:** Q402 sign-to-pay protocol with Custom Smart Contracts
 
 <p align="center">
-  <img src="assets/Arch1.png" width="250">
-  <img src="assets/Arch2.png" width="250">
+  <img src="assets/Arch1.png" width="350">
+  <img src="assets/Arch2.png" width="350">
 </p>
 
 ## ⚙️ Key Integrations

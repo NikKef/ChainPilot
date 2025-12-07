@@ -33,6 +33,11 @@ ChainPilot is a chat-based Web3 copilot that enables users to interact with the 
 - **DEX:** PancakeSwap V2/V3 Router
 - **Execution/Facilitator:** Q402 sign-to-pay protocol with Custom Smart Contracts
 
+<p float="left">
+  <img src="assets/Arch1.png" width="250">
+  <img src="assets/Arch2.png" width="250">
+</p>
+
 
 ## ⚙️ Key Integrations
 
